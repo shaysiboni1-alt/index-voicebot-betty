@@ -1,5 +1,5 @@
 /**
- * Index Betty VoiceBot – Server Skeleton
+ * Index Betty VoiceBot – Server Skeleton (CommonJS)
  * Stage 1: Infrastructure only (NO AI, NO intents, NO lead logic)
  *
  * Includes:
@@ -10,18 +10,16 @@
  * - CALL_LOG webhook on call end
  */
 
-import express from "express";
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
-import fetch from "node-fetch";
-import bodyParser from "body-parser";
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
 const CALL_LOG_WEBHOOK = process.env.CALL_LOG_WEBHOOK_URL || null;
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 /* =========================
    Health
@@ -35,20 +33,24 @@ app.get("/health", (_req, res) => {
 });
 
 /* =========================
-   Optional Twilio Voice Entry
+   Optional Twilio Voice Entry (TwiML)
 ========================= */
 app.post("/twilio-voice", (req, res) => {
   const wsUrl =
     process.env.TWILIO_STREAM_WS_URL ||
     "wss://index-voicebot-betty.onrender.com/twilio-media-stream";
 
+  const from = req.body.From || "";
+  const to = req.body.To || "";
+  const callSid = req.body.CallSid || "";
+
   const twiml = `
 <Response>
   <Connect>
     <Stream url="${wsUrl}">
-      <Parameter name="caller" value="${req.body.From || ""}" />
-      <Parameter name="called" value="${req.body.To || ""}" />
-      <Parameter name="callSid" value="${req.body.CallSid || ""}" />
+      <Parameter name="caller" value="${from}" />
+      <Parameter name="called" value="${to}" />
+      <Parameter name="callSid" value="${callSid}" />
       <Parameter name="source" value="Index Betty Voice AI" />
     </Stream>
   </Connect>
@@ -61,11 +63,11 @@ app.post("/twilio-voice", (req, res) => {
    HTTP + WS Server
 ========================= */
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/twilio-media-stream" });
+const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 /**
  * In-memory call sessions
- * callSid => { startedAt, caller, called }
+ * callSid => { startedAt, caller, called, source }
  */
 const calls = new Map();
 
@@ -80,7 +82,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.event === "start") {
+    if (msg.event === "start" && msg.start) {
       const { callSid, customParameters } = msg.start;
 
       calls.set(callSid, {
@@ -92,9 +94,10 @@ wss.on("connection", (ws) => {
       });
 
       console.log("[WS] start", msg.start);
+      return;
     }
 
-    if (msg.event === "stop") {
+    if (msg.event === "stop" && msg.stop) {
       const callSid = msg.stop.callSid;
       const session = calls.get(callSid);
 
@@ -124,12 +127,13 @@ wss.on("connection", (ws) => {
               }),
             });
           } catch (e) {
-            console.log("Failed sending CALL_LOG:", e?.message || e);
+            console.log("Failed sending CALL_LOG:", e && (e.message || e));
           }
         }
 
         calls.delete(callSid);
       }
+      return;
     }
   });
 
