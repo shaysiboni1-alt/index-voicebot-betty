@@ -1,12 +1,12 @@
 // server.js
 // Index Betty – Realtime VoiceBot (OpenAI only)
 // BASELINE: user's server_fixed.js (tested)
-// ADDITIONS (minimal):
+// ADDITIONS (minimal, safe):
 // - SSOT load from Google Sheets (SETTINGS + PROMPTS + INTENTS + INTENT_SUGGESTIONS) with TTL cache
 // - Use PROMPTS (if present) to build instructions; fallback to baseline hardcoded instructions
 // - Use SETTINGS.OPENING_SCRIPT (if present) with {GREETING}; fallback to baseline opening
-// - Buffer outbound audio until Twilio streamSid exists (prevents losing early audio)
-// - Fix duplicate response.create during initial response (conversation_already_has_active_response)
+// - Buffer outbound audio until streamSid exists, and ALSO derive streamSid from msg.streamSid on media/stop
+// - Fix: mark responseInFlight for initial response.create to avoid duplicate create errors
 
 const express = require("express");
 const http = require("http");
@@ -92,7 +92,7 @@ async function readRange(sheets, range) {
 }
 
 async function loadSSOT(force = false) {
-  // If SSOT env is missing, we do NOT crash baseline voicebot.
+  // Do NOT crash voicebot if SSOT env is missing; fallback to baseline behavior
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
     ssotCache = {
       ...ssotCache,
@@ -104,9 +104,7 @@ async function loadSSOT(force = false) {
   }
 
   const now = Date.now();
-  if (!force && ssotCache.ok && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) {
-    return ssotCache;
-  }
+  if (!force && ssotCache.ok && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) return ssotCache;
 
   try {
     const sheets = getSheetsClient();
@@ -172,7 +170,7 @@ async function loadSSOT(force = false) {
 }
 
 function buildInstructionsFromSSOT(ssot) {
-  // Baseline fallback (exactly as you had)
+  // Baseline fallback (exactly as your tested code)
   const fallback = [
     "את בטי, בוטית קולית נשית, אנרגטית, שמחה ושנונה.",
     "מדברת עברית טבעית עם סלנג עדין, בלי אימוג׳ים ובלי סימנים מוקראים.",
@@ -184,8 +182,6 @@ function buildInstructionsFromSSOT(ssot) {
   if (!ssot || !ssot.ok) return fallback;
 
   const { settings, prompts } = ssot;
-
-  // Prefer PROMPTS if present; otherwise fallback to baseline.
   const merged = [prompts.MASTER_PROMPT, prompts.GUARDRAILS_PROMPT, prompts.KB_PROMPT]
     .filter(Boolean)
     .join(" ")
@@ -193,7 +189,6 @@ function buildInstructionsFromSSOT(ssot) {
 
   if (!merged) return fallback;
 
-  // Simple token replacements (safe)
   return merged
     .replace(/{BUSINESS_NAME}/g, settings.BUSINESS_NAME || "")
     .replace(/{BOT_NAME}/g, settings.BOT_NAME || "");
@@ -204,7 +199,6 @@ function buildOpeningFromSSOT(ssot) {
   const fallback = `${g.text}, אני בטי הבוטית, העוזרת של מרגריטה. איך אפשר לעזור?`;
 
   if (!ssot || !ssot.ok) return fallback;
-
   const { settings } = ssot;
   const tpl = (settings.OPENING_SCRIPT || "").trim();
   if (!tpl) return fallback;
@@ -242,7 +236,6 @@ const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 wss.on("connection", async (twilioWs) => {
   console.log("[WS] connection established");
 
-  // Load SSOT once per connection (cached)
   const ssot = await loadSSOT();
 
   let streamSid = null;
@@ -261,7 +254,7 @@ wss.on("connection", async (twilioWs) => {
   const audioQueue = [];
   const MAX_QUEUE_FRAMES = 400; // safety cap
 
-  // Queue OUTBOUND audio until streamSid exists (prevents losing early deltas)
+  // Buffer outbound audio until we know streamSid
   const outAudioQueue = [];
   const MAX_OUT_QUEUE_FRAMES = 400;
 
@@ -281,7 +274,6 @@ wss.on("connection", async (twilioWs) => {
     if (!openaiReady || !sessionConfigured) return;
     while (audioQueue.length) {
       const payload = audioQueue.shift();
-      // Count inbound audio frames to gate turn-taking.
       userFramesSinceLastCreate += 1;
       lastUserAudioAt = Date.now();
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
@@ -308,23 +300,15 @@ wss.on("connection", async (twilioWs) => {
   }
 
   function maybeCreateResponse(openaiWs, reason) {
-    // Debounce + minimum-audio gate to avoid duplicate responses on multiple speech_stopped events.
     const now = Date.now();
-
-    // If we already created a response and it's still in flight, do nothing.
     if (responseInFlight) return;
 
-    // Require the OpenAI WS to be fully ready; otherwise defer once.
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
       return;
     }
 
-    // Hard debounce window (ms) – prevents back-to-back response.create from rapid events.
     const DEBOUNCE_MS = 1200;
-
-    // Minimum number of Twilio audio frames received since the last create.
-    // Twilio Media Streams typically send 20ms frames; 8 frames ~= 160ms of speech.
     const MIN_FRAMES = 8;
 
     if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
@@ -370,7 +354,6 @@ wss.on("connection", async (twilioWs) => {
       max_response_output_tokens: "inf",
     };
 
-    // Correct Realtime STT field name:
     if (MB_TRANSCRIPTION_MODEL) {
       session.input_audio_transcription = {
         model: MB_TRANSCRIPTION_MODEL,
@@ -381,7 +364,6 @@ wss.on("connection", async (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // Opening (SSOT if exists; fallback to baseline)
     const opening = buildOpeningFromSSOT(ssot);
 
     safeSend(openaiWs, {
@@ -393,8 +375,7 @@ wss.on("connection", async (twilioWs) => {
       },
     });
 
-    // IMPORTANT FIX:
-    // Mark responseInFlight = true for the initial response to avoid "conversation_already_has_active_response"
+    // mark in-flight for initial response to avoid duplicate response.create
     lastResponseCreateAt = Date.now();
     userFramesSinceLastCreate = 0;
     safeSend(openaiWs, { type: "response.create" });
@@ -417,26 +398,22 @@ wss.on("connection", async (twilioWs) => {
       return;
     }
 
-    // When the model finished speaking, allow the next user turn to trigger a new response.
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
       return;
     }
 
-    // Capture explicit API errors
     if (msg.type === "error") {
       console.error("[OPENAI] error event", msg);
-      // Do not hard-close; just allow next turn after error
       responseInFlight = false;
       return;
     }
 
-    // OUT audio:
     if (msg.type === "response.audio.delta") {
       const payload = msg.delta;
       if (!payload) return;
 
-      // If streamSid not ready yet, buffer it
+      // If streamSid isn't known yet, buffer (do NOT drop)
       if (!streamSid) {
         outAudioQueue.push(payload);
         if (outAudioQueue.length > MAX_OUT_QUEUE_FRAMES) {
@@ -477,8 +454,22 @@ wss.on("connection", async (twilioWs) => {
       return;
     }
 
+    // Always log Twilio event types (minimal)
+    if (msg.event) {
+      if (msg.event !== "media") {
+        console.log("[TWILIO] event", msg.event);
+      }
+    }
+
+    // IMPORTANT: Derive streamSid even if "start" doesn't arrive
+    if (!streamSid && msg.streamSid) {
+      streamSid = msg.streamSid;
+      console.log("[WS] streamSid derived from msg.streamSid", streamSid);
+      flushOutAudioToTwilio();
+    }
+
     if (msg.event === "start") {
-      streamSid = msg.start?.streamSid || null;
+      streamSid = msg.start?.streamSid || streamSid || null;
       callSid = msg.start?.callSid || null;
       console.log("[WS] start", {
         accountSid: msg.start?.accountSid,
@@ -489,7 +480,6 @@ wss.on("connection", async (twilioWs) => {
         customParameters: msg.start?.customParameters || {},
       });
 
-      // Flush any outbound audio we buffered before Twilio sent streamSid
       flushOutAudioToTwilio();
       return;
     }
@@ -497,6 +487,13 @@ wss.on("connection", async (twilioWs) => {
     if (msg.event === "media") {
       const payload = msg.media?.payload;
       if (!payload) return;
+
+      // Derive streamSid from media if needed
+      if (!streamSid && msg.streamSid) {
+        streamSid = msg.streamSid;
+        console.log("[WS] streamSid derived from media", streamSid);
+        flushOutAudioToTwilio();
+      }
 
       if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
         audioQueue.push(payload);
@@ -511,6 +508,13 @@ wss.on("connection", async (twilioWs) => {
     }
 
     if (msg.event === "stop") {
+      // Derive streamSid from stop if needed
+      if (!streamSid && msg.streamSid) {
+        streamSid = msg.streamSid;
+        console.log("[WS] streamSid derived from stop", streamSid);
+        flushOutAudioToTwilio();
+      }
+
       console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
       try {
         if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
