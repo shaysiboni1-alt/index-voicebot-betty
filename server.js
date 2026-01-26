@@ -1,12 +1,12 @@
 // server.js
-// Index Betty – Realtime VoiceBot (OpenAI baseline)
-// Stage: SSOT Runtime Integration (Google Sheets) + Fix audio output race + Turn-taking
-// Fixes:
-// 1) Buffer outbound audio until Twilio streamSid exists (prevents "no audio at all").
-// 2) Re-add server_vad speech_stopped -> response.create with debounce/min-audio gating.
-// 3) Add basic OpenAI event logging for easier debugging.
-//
-// Excludes (by design): Gemini, Hybrid, Webhooks FINAL/ABANDONED, Recording, Lead Gate
+// Index Betty – Realtime VoiceBot (OpenAI only)
+// BASELINE: user's server_fixed.js (tested)
+// ADDITIONS (minimal):
+// - SSOT load from Google Sheets (SETTINGS + PROMPTS + INTENTS + INTENT_SUGGESTIONS) with TTL cache
+// - Use PROMPTS (if present) to build instructions; fallback to baseline hardcoded instructions
+// - Use SETTINGS.OPENING_SCRIPT (if present) with {GREETING}; fallback to baseline opening
+// - Buffer outbound audio until Twilio streamSid exists (prevents losing early audio)
+// - Fix duplicate response.create during initial response (conversation_already_has_active_response)
 
 const express = require("express");
 const http = require("http");
@@ -15,35 +15,29 @@ const { google } = require("googleapis");
 
 const PORT = process.env.PORT || 10000;
 
-// ===== ENV =====
 const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const OPENAI_VOICE = (process.env.OPENAI_VOICE || "alloy").trim();
+const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
-const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
-const GOOGLE_SERVICE_ACCOUNT_JSON_B64 =
-  (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
-
-const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim();
+const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
 
 const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
 const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 900);
 const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
 
-// ===== Guards =====
+// SSOT ENV
+const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
+const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
+const SSOT_CACHE_TTL_MS = Number(process.env.SSOT_CACHE_TTL_MS || 60_000);
+
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
   process.exit(1);
 }
-if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
-  console.error("[FATAL] Missing GSHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON_B64");
-  process.exit(1);
-}
 
-// ===== Utils =====
 function nowIso() {
   return new Date().toISOString();
 }
@@ -67,13 +61,14 @@ function getGreetingBucketAndText() {
 }
 
 // ===== SSOT (Google Sheets) =====
-const SSOT_CACHE_TTL_MS = 60 * 1000; // 1 minute
 let ssotCache = {
   loadedAt: 0,
   settings: {},
   prompts: {},
   intents: [],
   intentSuggestions: [],
+  ok: false,
+  error: null,
 };
 
 function getSheetsClient() {
@@ -88,116 +83,185 @@ function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
-async function loadSSOT(force = false) {
-  const now = Date.now();
-  if (!force && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) return ssotCache;
-
-  const sheets = getSheetsClient();
-
-  async function readRange(range) {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: GSHEET_ID,
-      range,
-    });
-    return res.data.values || [];
-  }
-
-  // SETTINGS (A:B)
-  const settingsRows = await readRange("SETTINGS!A:B");
-  const settings = {};
-  settingsRows.slice(1).forEach(([key, value]) => {
-    if (key) settings[key.trim()] = (value || "").toString().trim();
+async function readRange(sheets, range) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GSHEET_ID,
+    range,
   });
-
-  // PROMPTS (A:B)
-  const promptsRows = await readRange("PROMPTS!A:B");
-  const prompts = {};
-  promptsRows.slice(1).forEach(([id, content]) => {
-    if (id) prompts[id.trim()] = (content || "").toString().trim();
-  });
-
-  // INTENTS (A:E)
-  const intentsRows = await readRange("INTENTS!A:E");
-  const intents = intentsRows.slice(1).map((row) => ({
-    intent: row[0],
-    priority: Number(row[1] || 0),
-    trigger_type: row[2],
-    triggers_he: row[3],
-    notes: row[4],
-  }));
-
-  // INTENT_SUGGESTIONS (A:F) read-only for now
-  const intentSuggestionsRows = await readRange("INTENT_SUGGESTIONS!A:F");
-  const intentSuggestions = intentSuggestionsRows.slice(1).map((row) => ({
-    phrase_he: row[0],
-    detected_intent: row[1],
-    occurrences: row[2],
-    last_seen_at: row[3],
-    approved: row[4],
-    notes: row[5],
-  }));
-
-  ssotCache = {
-    loadedAt: now,
-    settings,
-    prompts,
-    intents,
-    intentSuggestions,
-  };
-
-  console.log("[SSOT] loaded", {
-    settings_count: Object.keys(settings).length,
-    prompts_count: Object.keys(prompts).length,
-    intents_count: intents.length,
-  });
-
-  return ssotCache;
+  return res.data.values || [];
 }
 
-// ===== Express =====
+async function loadSSOT(force = false) {
+  // If SSOT env is missing, we do NOT crash baseline voicebot.
+  if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    ssotCache = {
+      ...ssotCache,
+      ok: false,
+      error: "SSOT env missing (GSHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON_B64)",
+      loadedAt: Date.now(),
+    };
+    return ssotCache;
+  }
+
+  const now = Date.now();
+  if (!force && ssotCache.ok && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) {
+    return ssotCache;
+  }
+
+  try {
+    const sheets = getSheetsClient();
+
+    const settingsRows = await readRange(sheets, "SETTINGS!A:B");
+    const settings = {};
+    settingsRows.slice(1).forEach(([key, value]) => {
+      if (key) settings[String(key).trim()] = (value || "").toString().trim();
+    });
+
+    const promptsRows = await readRange(sheets, "PROMPTS!A:B");
+    const prompts = {};
+    promptsRows.slice(1).forEach(([id, content]) => {
+      if (id) prompts[String(id).trim()] = (content || "").toString().trim();
+    });
+
+    const intentsRows = await readRange(sheets, "INTENTS!A:E");
+    const intents = intentsRows.slice(1).map((row) => ({
+      intent: row[0],
+      priority: Number(row[1] || 0),
+      trigger_type: row[2],
+      triggers_he: row[3],
+      notes: row[4],
+    }));
+
+    const intentSuggestionsRows = await readRange(sheets, "INTENT_SUGGESTIONS!A:F");
+    const intentSuggestions = intentSuggestionsRows.slice(1).map((row) => ({
+      phrase_he: row[0],
+      detected_intent: row[1],
+      occurrences: row[2],
+      last_seen_at: row[3],
+      approved: row[4],
+      notes: row[5],
+    }));
+
+    ssotCache = {
+      loadedAt: now,
+      settings,
+      prompts,
+      intents,
+      intentSuggestions,
+      ok: true,
+      error: null,
+    };
+
+    console.log("[SSOT] loaded", {
+      settings_count: Object.keys(settings).length,
+      prompts_count: Object.keys(prompts).length,
+      intents_count: intents.length,
+    });
+
+    return ssotCache;
+  } catch (e) {
+    ssotCache = {
+      ...ssotCache,
+      ok: false,
+      error: e && (e.message || String(e)),
+      loadedAt: Date.now(),
+    };
+    console.error("[SSOT] load failed", ssotCache.error);
+    return ssotCache;
+  }
+}
+
+function buildInstructionsFromSSOT(ssot) {
+  // Baseline fallback (exactly as you had)
+  const fallback = [
+    "את בטי, בוטית קולית נשית, אנרגטית, שמחה ושנונה.",
+    "מדברת עברית טבעית עם סלנג עדין, בלי אימוג׳ים ובלי סימנים מוקראים.",
+    "כל תגובה קצרה וממוקדת, ובכל תגובה שאלה אחת בלבד.",
+    "אם הלקוח מתחיל באנגלית או מבקש לעבור לאנגלית, עברי לאנגלית.",
+    "אל תמציאי מידע משרדי; תמסרי מידע רק אם נשאלת עליו במפורש ובהמשך נמשוך אותו מה-SETTINGS.",
+  ].join(" ");
+
+  if (!ssot || !ssot.ok) return fallback;
+
+  const { settings, prompts } = ssot;
+
+  // Prefer PROMPTS if present; otherwise fallback to baseline.
+  const merged = [prompts.MASTER_PROMPT, prompts.GUARDRAILS_PROMPT, prompts.KB_PROMPT]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
+  if (!merged) return fallback;
+
+  // Simple token replacements (safe)
+  return merged
+    .replace(/{BUSINESS_NAME}/g, settings.BUSINESS_NAME || "")
+    .replace(/{BOT_NAME}/g, settings.BOT_NAME || "");
+}
+
+function buildOpeningFromSSOT(ssot) {
+  const g = getGreetingBucketAndText();
+  const fallback = `${g.text}, אני בטי הבוטית, העוזרת של מרגריטה. איך אפשר לעזור?`;
+
+  if (!ssot || !ssot.ok) return fallback;
+
+  const { settings } = ssot;
+  const tpl = (settings.OPENING_SCRIPT || "").trim();
+  if (!tpl) return fallback;
+
+  return tpl.replace("{GREETING}", g.text);
+}
+
 const app = express();
 app.use(express.json());
 
 app.get("/health", async (req, res) => {
-  await loadSSOT();
+  const ssot = await loadSSOT();
   res.json({
     ok: true,
     service: "index-betty-voicebot",
     ts: nowIso(),
     provider_mode: "openai",
+    stt_enabled: !!MB_TRANSCRIPTION_MODEL,
     model: OPENAI_REALTIME_MODEL,
     voice: OPENAI_VOICE,
-    ssot_loaded_at: ssotCache.loadedAt,
+    ssot: {
+      ok: ssot.ok,
+      loaded_at: ssot.loadedAt,
+      error: ssot.error,
+      settings_count: ssot.ok ? Object.keys(ssot.settings).length : 0,
+      prompts_count: ssot.ok ? Object.keys(ssot.prompts).length : 0,
+      intents_count: ssot.ok ? ssot.intents.length : 0,
+    },
   });
 });
 
-// ===== WebSocket Server =====
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", async (twilioWs) => {
   console.log("[WS] connection established");
 
-  await loadSSOT();
+  // Load SSOT once per connection (cached)
+  const ssot = await loadSSOT();
 
   let streamSid = null;
   let callSid = null;
 
-  // OpenAI readiness gates
-  let openaiReady = false;
-  let sessionConfigured = false;
-
-  // Turn-taking
-  let pendingCreate = false;
-  let responseInFlight = false;
+  // OpenAI session readiness gates
+  let openaiReady = false; // WS open
+  let sessionConfigured = false; // after we send session.update
+  let pendingCreate = false; // if we got speech_stopped before ready
+  let responseInFlight = false; // prevent duplicate response.create
   let lastResponseCreateAt = 0;
   let userFramesSinceLastCreate = 0;
+  let lastUserAudioAt = 0;
 
-  // Buffer inbound audio until OpenAI ready
-  const inAudioQueue = [];
-  const MAX_IN_QUEUE_FRAMES = 400;
+  // Queue Twilio audio until OpenAI WS is ready
+  const audioQueue = [];
+  const MAX_QUEUE_FRAMES = 400; // safety cap
 
-  // Buffer outbound audio until Twilio streamSid exists (FIX for "no audio at all")
+  // Queue OUTBOUND audio until streamSid exists (prevents losing early deltas)
   const outAudioQueue = [];
   const MAX_OUT_QUEUE_FRAMES = 400;
 
@@ -212,12 +276,14 @@ wss.on("connection", async (twilioWs) => {
     }
   }
 
-  function flushInAudio(openaiWs) {
+  function flushAudioQueue(openaiWs) {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
     if (!openaiReady || !sessionConfigured) return;
-    while (inAudioQueue.length) {
-      const payload = inAudioQueue.shift();
+    while (audioQueue.length) {
+      const payload = audioQueue.shift();
+      // Count inbound audio frames to gate turn-taking.
       userFramesSinceLastCreate += 1;
+      lastUserAudioAt = Date.now();
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
     }
   }
@@ -242,17 +308,24 @@ wss.on("connection", async (twilioWs) => {
   }
 
   function maybeCreateResponse(openaiWs, reason) {
+    // Debounce + minimum-audio gate to avoid duplicate responses on multiple speech_stopped events.
     const now = Date.now();
+
+    // If we already created a response and it's still in flight, do nothing.
     if (responseInFlight) return;
 
+    // Require the OpenAI WS to be fully ready; otherwise defer once.
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
       return;
     }
 
-    // Debounce + minimum-audio gate
+    // Hard debounce window (ms) – prevents back-to-back response.create from rapid events.
     const DEBOUNCE_MS = 1200;
-    const MIN_FRAMES = 8; // ~160ms
+
+    // Minimum number of Twilio audio frames received since the last create.
+    // Twilio Media Streams typically send 20ms frames; 8 frames ~= 160ms of speech.
+    const MIN_FRAMES = 8;
 
     if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
     if (userFramesSinceLastCreate < MIN_FRAMES) return;
@@ -263,7 +336,6 @@ wss.on("connection", async (twilioWs) => {
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
     responseInFlight = true;
-
     console.log("[TURN] response.create", reason || "speech_stopped");
   }
 
@@ -281,23 +353,14 @@ wss.on("connection", async (twilioWs) => {
     console.log("[OPENAI] ws open");
     openaiReady = true;
 
-    const { settings, prompts } = ssotCache;
-
-    const systemInstructions = [
-      prompts.MASTER_PROMPT || "",
-      prompts.GUARDRAILS_PROMPT || "",
-      prompts.KB_PROMPT || "",
-    ]
-      .join(" ")
-      .replace(/{BUSINESS_NAME}/g, settings.BUSINESS_NAME || "")
-      .replace(/{BOT_NAME}/g, settings.BOT_NAME || "");
+    const instructions = buildInstructionsFromSSOT(ssot);
 
     const session = {
       modalities: ["audio", "text"],
       voice: OPENAI_VOICE,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
-      instructions: systemInstructions,
+      instructions,
       turn_detection: {
         type: "server_vad",
         threshold: MB_VAD_THRESHOLD,
@@ -318,10 +381,8 @@ wss.on("connection", async (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // Opening (from SSOT)
-    const g = getGreetingBucketAndText();
-    const openingTemplate = settings.OPENING_SCRIPT || "{GREETING}";
-    const opening = openingTemplate.replace("{GREETING}", g.text);
+    // Opening (SSOT if exists; fallback to baseline)
+    const opening = buildOpeningFromSSOT(ssot);
 
     safeSend(openaiWs, {
       type: "conversation.item.create",
@@ -332,16 +393,15 @@ wss.on("connection", async (twilioWs) => {
       },
     });
 
-    // Force first response (greeting)
+    // IMPORTANT FIX:
+    // Mark responseInFlight = true for the initial response to avoid "conversation_already_has_active_response"
+    lastResponseCreateAt = Date.now();
+    userFramesSinceLastCreate = 0;
     safeSend(openaiWs, { type: "response.create" });
     responseInFlight = true;
 
-    flushInAudio(openaiWs);
-
-    if (pendingCreate) {
-      // If user already spoke before OpenAI ready, try to answer
-      maybeCreateResponse(openaiWs, "pending_after_open");
-    }
+    flushAudioQueue(openaiWs);
+    if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
 
   openaiWs.on("message", (raw) => {
@@ -352,37 +412,31 @@ wss.on("connection", async (twilioWs) => {
       return;
     }
 
-    // Useful debug for silent failures (do not spam deltas)
-    if (
-      msg.type &&
-      msg.type !== "response.audio.delta" &&
-      msg.type !== "input_audio_buffer.append" &&
-      msg.type !== "input_audio_buffer.committed"
-    ) {
-      if (msg.type === "error") {
-        console.error("[OPENAI] error event", msg);
-      } else if (msg.type === "session.updated") {
-        console.log("[OPENAI] session.updated");
-      } else if (msg.type === "response.created") {
-        // quiet
-      } else {
-        // keep it light
-        // console.log("[OPENAI] event", msg.type);
-      }
-    }
-
-    // Turn boundary (server_vad)
     if (msg.type === "input_audio_buffer.speech_stopped") {
       maybeCreateResponse(openaiWs, "speech_stopped");
       return;
     }
 
-    // Audio out
+    // When the model finished speaking, allow the next user turn to trigger a new response.
+    if (msg.type === "response.audio.done" || msg.type === "response.completed") {
+      responseInFlight = false;
+      return;
+    }
+
+    // Capture explicit API errors
+    if (msg.type === "error") {
+      console.error("[OPENAI] error event", msg);
+      // Do not hard-close; just allow next turn after error
+      responseInFlight = false;
+      return;
+    }
+
+    // OUT audio:
     if (msg.type === "response.audio.delta") {
       const payload = msg.delta;
       if (!payload) return;
 
-      // If Twilio streamSid not ready yet, buffer outbound audio
+      // If streamSid not ready yet, buffer it
       if (!streamSid) {
         outAudioQueue.push(payload);
         if (outAudioQueue.length > MAX_OUT_QUEUE_FRAMES) {
@@ -402,13 +456,6 @@ wss.on("connection", async (twilioWs) => {
       } catch (e) {
         console.error("[TWILIO] send media failed", e && (e.message || e));
       }
-      return;
-    }
-
-    // Response completed gates next turn
-    if (msg.type === "response.audio.done" || msg.type === "response.completed") {
-      responseInFlight = false;
-      return;
     }
   });
 
@@ -422,7 +469,6 @@ wss.on("connection", async (twilioWs) => {
     console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
-  // ===== Twilio WS inbound =====
   twilioWs.on("message", (raw) => {
     let msg;
     try {
@@ -434,15 +480,16 @@ wss.on("connection", async (twilioWs) => {
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
-
       console.log("[WS] start", {
+        accountSid: msg.start?.accountSid,
         streamSid,
         callSid,
+        tracks: msg.start?.tracks,
         mediaFormat: msg.start?.mediaFormat,
         customParameters: msg.start?.customParameters || {},
       });
 
-      // Flush any audio that was produced before streamSid was known
+      // Flush any outbound audio we buffered before Twilio sent streamSid
       flushOutAudioToTwilio();
       return;
     }
@@ -452,14 +499,13 @@ wss.on("connection", async (twilioWs) => {
       if (!payload) return;
 
       if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
-        inAudioQueue.push(payload);
-        if (inAudioQueue.length > MAX_IN_QUEUE_FRAMES) {
-          inAudioQueue.splice(0, inAudioQueue.length - MAX_IN_QUEUE_FRAMES);
+        audioQueue.push(payload);
+        if (audioQueue.length > MAX_QUEUE_FRAMES) {
+          audioQueue.splice(0, audioQueue.length - MAX_QUEUE_FRAMES);
         }
         return;
       }
 
-      userFramesSinceLastCreate += 1;
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
       return;
     }
