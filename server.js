@@ -3,7 +3,6 @@
 // Twilio Media Streams <-> OpenAI Realtime
 // No Sheets, No Leads, No Prompts – Voice loop only
 
-require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
