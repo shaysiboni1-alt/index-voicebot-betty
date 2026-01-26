@@ -1,32 +1,45 @@
-// server_fixed.js
-// Index Betty – Realtime VoiceBot (OpenAI only)
-// Fix: prevent send() while WS CONNECTING; queue audio + deferred response.create
-// Adds: safeSend helper, audio buffer queue, and correct Realtime STT field (input_audio_transcription)
+// server.js
+// Index Betty – Realtime VoiceBot (OpenAI baseline)
+// Stage: SSOT Runtime Integration (Google Sheets)
+// Includes: SETTINGS + PROMPTS + INTENTS loading with cache, dynamic opening & instructions
+// Excludes (by design): Gemini, Hybrid, Webhooks FINAL/ABANDONED, Recording, Lead Gate
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const { google } = require("googleapis");
 
 const PORT = process.env.PORT || 10000;
 
+// ===== ENV =====
 const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
-const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
+const GSHEET_ID = process.env.GSHEET_ID || "";
+const GOOGLE_SERVICE_ACCOUNT_JSON_B64 =
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
+
+const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim();
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
 
 const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
 const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 900);
 const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
 
+// ===== Guards =====
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
   process.exit(1);
 }
+if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+  console.error("[FATAL] Missing GSHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON_B64");
+  process.exit(1);
+}
 
+// ===== Utils =====
 function nowIso() {
   return new Date().toISOString();
 }
@@ -49,96 +62,139 @@ function getGreetingBucketAndText() {
   return { bucket: "night", text: "לילה טוב" };
 }
 
+// ===== SSOT (Google Sheets) =====
+const SSOT_CACHE_TTL_MS = 60 * 1000; // 1 minute
+let ssotCache = {
+  loadedAt: 0,
+  settings: {},
+  prompts: {},
+  intents: [],
+  intentSuggestions: [],
+};
+
+function getSheetsClient() {
+  const json = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+  const creds = JSON.parse(json);
+  const auth = new google.auth.JWT(
+    creds.client_email,
+    null,
+    creds.private_key,
+    ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+  );
+  return google.sheets({ version: "v4", auth });
+}
+
+async function loadSSOT(force = false) {
+  const now = Date.now();
+  if (!force && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) {
+    return ssotCache;
+  }
+
+  const sheets = getSheetsClient();
+
+  async function readRange(range) {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: GSHEET_ID,
+      range,
+    });
+    return res.data.values || [];
+  }
+
+  // SETTINGS
+  const settingsRows = await readRange("SETTINGS!A:B");
+  const settings = {};
+  settingsRows.slice(1).forEach(([key, value]) => {
+    if (key) settings[key.trim()] = (value || "").toString().trim();
+  });
+
+  // PROMPTS
+  const promptsRows = await readRange("PROMPTS!A:B");
+  const prompts = {};
+  promptsRows.slice(1).forEach(([id, content]) => {
+    if (id) prompts[id.trim()] = (content || "").toString().trim();
+  });
+
+  // INTENTS
+  const intentsRows = await readRange("INTENTS!A:E");
+  const intents = intentsRows.slice(1).map((row) => ({
+    intent: row[0],
+    priority: Number(row[1] || 0),
+    trigger_type: row[2],
+    triggers_he: row[3],
+    notes: row[4],
+  }));
+
+  // INTENT_SUGGESTIONS (read only for now)
+  const intentSuggestionsRows = await readRange("INTENT_SUGGESTIONS!A:F");
+  const intentSuggestions = intentSuggestionsRows.slice(1).map((row) => ({
+    phrase_he: row[0],
+    detected_intent: row[1],
+    occurrences: row[2],
+    last_seen_at: row[3],
+    approved: row[4],
+    notes: row[5],
+  }));
+
+  ssotCache = {
+    loadedAt: now,
+    settings,
+    prompts,
+    intents,
+    intentSuggestions,
+  };
+
+  console.log("[SSOT] loaded", {
+    settings_count: Object.keys(settings).length,
+    prompts_count: Object.keys(prompts).length,
+    intents_count: intents.length,
+  });
+
+  return ssotCache;
+}
+
+// ===== Express =====
 const app = express();
 app.use(express.json());
 
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
+  await loadSSOT();
   res.json({
     ok: true,
     service: "index-betty-voicebot",
     ts: nowIso(),
     provider_mode: "openai",
-    stt_enabled: !!MB_TRANSCRIPTION_MODEL,
     model: OPENAI_REALTIME_MODEL,
+    ssot_loaded_at: ssotCache.loadedAt,
   });
 });
 
+// ===== WebSocket Server =====
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-wss.on("connection", (twilioWs) => {
+wss.on("connection", async (twilioWs) => {
   console.log("[WS] connection established");
+
+  await loadSSOT();
 
   let streamSid = null;
   let callSid = null;
 
-  // OpenAI session readiness gates
-  let openaiReady = false;          // WS open
-  let sessionConfigured = false;    // after we send session.update
-  let pendingCreate = false;        // if we got speech_stopped before ready
-  let responseInFlight = false;    // prevent duplicate response.create
-  let lastResponseCreateAt = 0;
-  let userFramesSinceLastCreate = 0;
-  let lastUserAudioAt = 0;
-        // if we got speech_stopped before ready
+  let openaiReady = false;
+  let sessionConfigured = false;
+  let responseInFlight = false;
 
-  // Queue Twilio audio until OpenAI WS is ready
   const audioQueue = [];
-  const MAX_QUEUE_FRAMES = 400; // safety cap
+  const MAX_QUEUE_FRAMES = 400;
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     try {
       ws.send(JSON.stringify(obj));
       return true;
-    } catch (e) {
-      console.error("[OPENAI] send failed", e && (e.message || e));
+    } catch {
       return false;
     }
-  }
-
-  function flushAudioQueue(openaiWs) {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-    if (!openaiReady || !sessionConfigured) return;
-    while (audioQueue.length) {
-      const payload = audioQueue.shift();
-      // Count inbound audio frames to gate turn-taking.
-      userFramesSinceLastCreate += 1;
-      lastUserAudioAt = Date.now();
-      safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
-    }
-  }
-
-  function maybeCreateResponse(openaiWs, reason) {
-    // Debounce + minimum-audio gate to avoid duplicate responses on multiple speech_stopped events.
-    const now = Date.now();
-
-    // If we already created a response and it's still in flight, do nothing.
-    if (responseInFlight) return;
-
-    // Require the OpenAI WS to be fully ready; otherwise defer once.
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
-      pendingCreate = true;
-      return;
-    }
-
-    // Hard debounce window (ms) – prevents back-to-back response.create from rapid events.
-    const DEBOUNCE_MS = 1200;
-
-    // Minimum number of Twilio audio frames received since the last create.
-    // Twilio Media Streams typically send 20ms frames; 8 frames ~= 160ms of speech.
-    const MIN_FRAMES = 8;
-
-    if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
-    if (userFramesSinceLastCreate < MIN_FRAMES) return;
-
-    lastResponseCreateAt = now;
-    userFramesSinceLastCreate = 0;
-
-    safeSend(openaiWs, { type: "response.create" });
-    pendingCreate = false;
-    responseInFlight = true;
-    console.log("[TURN] response.create", reason || "speech_stopped");
   }
 
   const openaiWs = new WebSocket(
@@ -152,23 +208,25 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    console.log("[OPENAI] ws open");
     openaiReady = true;
 
-    const instructions = [
-      "את בטי, בוטית קולית נשית, אנרגטית, שמחה ושנונה.",
-      "מדברת עברית טבעית עם סלנג עדין, בלי אימוג׳ים ובלי סימנים מוקראים.",
-      "כל תגובה קצרה וממוקדת, ובכל תגובה שאלה אחת בלבד.",
-      "אם הלקוח מתחיל באנגלית או מבקש לעבור לאנגלית, עברי לאנגלית.",
-      "אל תמציאי מידע משרדי; תמסרי מידע רק אם נשאלת עליו במפורש ובהמשך נמשוך אותו מה-SETTINGS.",
-    ].join(" ");
+    const { settings, prompts } = ssotCache;
+
+    const systemInstructions = [
+      prompts.MASTER_PROMPT || "",
+      prompts.GUARDRAILS_PROMPT || "",
+      prompts.KB_PROMPT || "",
+    ]
+      .join(" ")
+      .replace(/{BUSINESS_NAME}/g, settings.BUSINESS_NAME || "")
+      .replace(/{BOT_NAME}/g, settings.BOT_NAME || "");
 
     const session = {
       modalities: ["audio", "text"],
       voice: OPENAI_VOICE,
       input_audio_format: "g711_ulaw",
       output_audio_format: "g711_ulaw",
-      instructions,
+      instructions: systemInstructions,
       turn_detection: {
         type: "server_vad",
         threshold: MB_VAD_THRESHOLD,
@@ -178,7 +236,6 @@ wss.on("connection", (twilioWs) => {
       max_response_output_tokens: "inf",
     };
 
-    // Correct Realtime STT field name:
     if (MB_TRANSCRIPTION_MODEL) {
       session.input_audio_transcription = {
         model: MB_TRANSCRIPTION_MODEL,
@@ -189,9 +246,9 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // Opening
     const g = getGreetingBucketAndText();
-    const opening = `${g.text}, אני בטי הבוטית, העוזרת של מרגריטה. איך אפשר לעזור?`;
+    const openingTemplate = settings.OPENING_SCRIPT || "{GREETING}";
+    const opening = openingTemplate.replace("{GREETING}", g.text);
 
     safeSend(openaiWs, {
       type: "conversation.item.create",
@@ -203,8 +260,12 @@ wss.on("connection", (twilioWs) => {
     });
     safeSend(openaiWs, { type: "response.create" });
 
-    flushAudioQueue(openaiWs);
-    if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
+    while (audioQueue.length) {
+      safeSend(openaiWs, {
+        type: "input_audio_buffer.append",
+        audio: audioQueue.shift(),
+      });
+    }
   });
 
   openaiWs.on("message", (raw) => {
@@ -215,41 +276,19 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      maybeCreateResponse(openaiWs, "speech_stopped");
-      return;
+    if (msg.type === "response.audio.delta" && streamSid) {
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: msg.delta },
+        })
+      );
     }
 
-    
-
-    // When the model finished speaking, allow the next user turn to trigger a new response.
-    if (msg.type === "response.audio.done" || msg.type === "response.completed") {
+    if (msg.type === "response.completed") {
       responseInFlight = false;
-      return;
     }
-if (msg.type === "response.audio.delta" && streamSid) {
-      try {
-        twilioWs.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: msg.delta },
-          })
-        );
-      } catch (e) {
-        console.error("[TWILIO] send media failed", e && (e.message || e));
-      }
-    }
-  });
-
-  openaiWs.on("error", (e) => {
-    responseInFlight = false;
-    console.error("[OPENAI] ws error", e && (e.message || e));
-  });
-
-  openaiWs.on("close", (code, reason) => {
-    responseInFlight = false;
-    console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
   twilioWs.on("message", (raw) => {
@@ -263,14 +302,6 @@ if (msg.type === "response.audio.delta" && streamSid) {
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
-      console.log("[WS] start", {
-        accountSid: msg.start?.accountSid,
-        streamSid,
-        callSid,
-        tracks: msg.start?.tracks,
-        mediaFormat: msg.start?.mediaFormat,
-        customParameters: msg.start?.customParameters || {},
-      });
       return;
     }
 
@@ -278,39 +309,21 @@ if (msg.type === "response.audio.delta" && streamSid) {
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+      if (!openaiReady || !sessionConfigured) {
         audioQueue.push(payload);
         if (audioQueue.length > MAX_QUEUE_FRAMES) {
           audioQueue.splice(0, audioQueue.length - MAX_QUEUE_FRAMES);
         }
         return;
       }
-
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
-      return;
     }
 
     if (msg.event === "stop") {
-      console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
-      try {
-        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
-      } catch {}
-      return;
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.close(1000, "twilio_stop");
+      }
     }
-  });
-
-  twilioWs.on("close", () => {
-    console.log("[WS] closed");
-    try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_close");
-    } catch {}
-  });
-
-  twilioWs.on("error", (e) => {
-    console.error("[TWILIO] ws error", e && (e.message || e));
-    try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1011, "twilio_error");
-    } catch {}
   });
 });
 
