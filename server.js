@@ -7,7 +7,7 @@
  * - POST /twilio-voice (optional TwiML entry)
  * - WS /twilio-media-stream (Twilio Media Streams)
  * - Call lifecycle handling (start / stop)
- * - CALL_LOG webhook on call end
+ * - CALL_LOG webhook on call end (with logs + timeout)
  */
 
 const express = require("express");
@@ -15,7 +15,27 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
-const CALL_LOG_WEBHOOK = process.env.CALL_LOG_WEBHOOK_URL || null;
+
+// Support both names to avoid ENV mismatch mistakes
+const CALL_LOG_WEBHOOK =
+  (process.env.CALL_LOG_WEBHOOK_URL || "").trim() ||
+  (process.env.MB_CALL_LOG_WEBHOOK_URL || "").trim() ||
+  "";
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -28,7 +48,8 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "index-betty-voicebot",
-    ts: new Date().toISOString(),
+    ts: nowIso(),
+    call_log_webhook_configured: !!CALL_LOG_WEBHOOK,
   });
 });
 
@@ -71,6 +92,46 @@ const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
  */
 const calls = new Map();
 
+async function sendCallLog(session, endedAtMs) {
+  if (!CALL_LOG_WEBHOOK) {
+    console.log("[CALL_LOG] skipped (no webhook configured)");
+    return;
+  }
+
+  const durationSec = Math.max(0, Math.round((endedAtMs - session.startedAt) / 1000));
+  const payload = {
+    event: "CALL_LOG",
+    callSid: session.callSid,
+    caller: session.caller,
+    called: session.called,
+    started_at: new Date(session.startedAt).toISOString(),
+    ended_at: new Date(endedAtMs).toISOString(),
+    duration_sec: durationSec,
+    source: session.source,
+  };
+
+  try {
+    console.log("[CALL_LOG] sending...", { callSid: session.callSid });
+    const res = await fetchWithTimeout(
+      CALL_LOG_WEBHOOK,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+      4500
+    );
+    const txt = await res.text().catch(() => "");
+    if (!res.ok) {
+      console.log("[CALL_LOG] failed", { status: res.status, body: txt?.slice(0, 200) || "" });
+      return;
+    }
+    console.log("[CALL_LOG] delivered", { status: res.status });
+  } catch (e) {
+    console.log("[CALL_LOG] error", e && (e.message || e));
+  }
+}
+
 wss.on("connection", (ws) => {
   console.log("[WS] connection established");
 
@@ -105,33 +166,10 @@ wss.on("connection", (ws) => {
 
       if (session) {
         const endedAt = Date.now();
-        const durationSec = Math.max(
-          0,
-          Math.round((endedAt - session.startedAt) / 1000)
-        );
-
-        if (CALL_LOG_WEBHOOK) {
-          try {
-            await fetch(CALL_LOG_WEBHOOK, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                event: "CALL_LOG",
-                callSid,
-                caller: session.caller,
-                called: session.called,
-                started_at: new Date(session.startedAt).toISOString(),
-                ended_at: new Date(endedAt).toISOString(),
-                duration_sec: durationSec,
-                source: session.source,
-              }),
-            });
-          } catch (e) {
-            console.log("Failed sending CALL_LOG:", e && (e.message || e));
-          }
-        }
-
+        await sendCallLog(session, endedAt);
         calls.delete(callSid);
+      } else {
+        console.log("[CALL_LOG] no session found for callSid", callSid);
       }
       return;
     }
@@ -144,4 +182,5 @@ wss.on("connection", (ws) => {
 
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
+  console.log(`[BOOT] call_log_webhook_configured=${!!CALL_LOG_WEBHOOK}`);
 });
