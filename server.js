@@ -1,11 +1,12 @@
 // server.js
 // Index Betty – Realtime VoiceBot (OpenAI only)
-// LOCKED baseline preserved: SSOT preload, exact opening, queues, streamSid fallback, VAD turn-taking.
-// Added in this stage:
-// - STT transcription logging (user) + assistant text logging
-// - Intent detection from SSOT INTENTS
-// - Lead Gate: name required (soft validation), never ask again after captured
-// - Turn orchestration via response.create.response.instructions per turn
+// Aligned to SSOT PROMPTS + SETTINGS + INTENTS provided by user.
+// Fixes:
+// 1) STT logs only on FINAL transcripts (no char-by-char).
+// 2) Avoid "conversation_already_has_active_response": release responseInFlight ONLY on response.completed.
+// 3) Deterministic KB enforcement: office info + business info only from SETTINGS and only if explicitly asked.
+// 4) INTENTS parsing aligned to user's sheet: trigger_type = keyword|phrase|default|fallback; triggers_he comma-separated.
+// 5) Preserve baseline: SSOT preload, exact opening, streamSid fallback, queues, server_vad.
 
 const express = require("express");
 const http = require("http");
@@ -20,7 +21,7 @@ const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
-const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // required for STT logs
+const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // required for STT logs + intent/name
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
 
 const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
@@ -36,6 +37,7 @@ const SSOT_REFRESH_MS = Number(process.env.SSOT_REFRESH_MS || 60_000);
 // Debug
 const MB_LOG_TRANSCRIPTS = String(process.env.MB_LOG_TRANSCRIPTS || "true").toLowerCase() === "true";
 const MB_LOG_ASSISTANT_TEXT = String(process.env.MB_LOG_ASSISTANT_TEXT || "true").toLowerCase() === "true";
+const MB_DEBUG_TWILIO_EVENTS = String(process.env.MB_DEBUG_TWILIO_EVENTS || "true").toLowerCase() === "true";
 
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
@@ -64,7 +66,7 @@ function getGreetingBucketAndText() {
   return { bucket: "night", text: "לילה טוב" };
 }
 
-// ===== SSOT (Google Sheets) =====
+// ===== SSOT cache =====
 let ssotCache = {
   loadedAt: 0,
   settings: {},
@@ -96,7 +98,6 @@ async function readRange(sheets, range) {
 }
 
 async function loadSSOT(force = false) {
-  // Do NOT crash voicebot if SSOT env missing; fallback to baseline hardcoded behavior
   if (!GSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
     ssotCache = {
       ...ssotCache,
@@ -108,9 +109,7 @@ async function loadSSOT(force = false) {
   }
 
   const now = Date.now();
-  if (!force && ssotCache.ok && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) {
-    return ssotCache;
-  }
+  if (!force && ssotCache.ok && now - ssotCache.loadedAt < SSOT_CACHE_TTL_MS) return ssotCache;
 
   try {
     const sheets = getSheetsClient();
@@ -127,15 +126,16 @@ async function loadSSOT(force = false) {
       if (id) prompts[String(id).trim()] = (content || "").toString().trim();
     });
 
-    const intentsRows = await readRange(sheets, "INTENTS!A:E");
+    // USER'S INTENTS SHAPE:
+    // intent | priority | trigger_type | triggers_he
+    const intentsRows = await readRange(sheets, "INTENTS!A:D");
     const intents = intentsRows
       .slice(1)
       .map((row) => ({
         intent: (row[0] || "").toString().trim(),
         priority: Number(row[1] || 0),
-        trigger_type: (row[2] || "").toString().trim(),
-        triggers_he: (row[3] || "").toString().trim(),
-        notes: (row[4] || "").toString().trim(),
+        trigger_type: (row[2] || "").toString().trim(), // keyword|phrase|default|fallback
+        triggers_he: (row[3] || "").toString().trim(),  // comma-separated
       }))
       .filter((x) => x.intent);
 
@@ -178,20 +178,27 @@ async function loadSSOT(force = false) {
   }
 }
 
+// preload + refresh
+(async () => {
+  const ssot = await loadSSOT(true);
+  console.log("[SSOT] preload", { ok: ssot.ok, error: ssot.error || null });
+  setInterval(() => {
+    loadSSOT(false).catch(() => {});
+  }, SSOT_REFRESH_MS).unref();
+})();
+
 function buildInstructionsFromSSOT(ssot) {
-  // Baseline fallback (kept)
   const fallback = [
     "את בטי, בוטית קולית נשית, אנרגטית, שמחה ושנונה.",
-    "מדברת עברית טבעית עם סלנג עדין, בלי אימוג׳ים ובלי סימנים מוקראים.",
-    "כל תגובה קצרה וממוקדת, ובכל תגובה שאלה אחת בלבד.",
-    "אם הלקוח מתחיל באנגלית או מבקש לעבור לאנגלית, עברי לאנגלית.",
-    "אל תמציאי מידע משרדי; תמסרי מידע רק אם נשאלת עליו במפורש ובהמשך נמשוך אותו מה-SETTINGS.",
+    "מדברת עברית טבעית, בלי אימוג׳ים ובלי סימנים מוקראים.",
+    "שאלה אחת בלבד בכל תגובה.",
+    "אין להמציא מידע; מידע משרדי/עסקי רק אם נשאלו ובדיוק מתוך SETTINGS.",
   ].join(" ");
 
   if (!ssot || !ssot.ok) return fallback;
 
   const { settings, prompts } = ssot;
-  const merged = [prompts.MASTER_PROMPT, prompts.GUARDRAILS_PROMPT, prompts.KB_PROMPT]
+  const merged = [prompts.MASTER_PROMPT, prompts.GUARDRAILS_PROMPT, prompts.KB_PROMPT, prompts.LEAD_CAPTURE_PROMPT]
     .filter(Boolean)
     .join(" ")
     .trim();
@@ -205,79 +212,41 @@ function buildInstructionsFromSSOT(ssot) {
 
 function buildOpeningFromSSOT(ssot) {
   const g = getGreetingBucketAndText();
-  const fallback = `${g.text}, אני בטי הבוטית, העוזרת של מרגריטה. איך אפשר לעזור?`;
-
+  const fallback = `${g.text}, אני בטי הבוטית, העוזרת של מרגריטה. מה השם בבקשה?`;
   if (!ssot || !ssot.ok) return { text: fallback, bucket: g.bucket };
-  const { settings } = ssot;
 
-  const tpl = (settings.OPENING_SCRIPT || "").trim();
+  const tpl = (ssot.settings.OPENING_SCRIPT || "").trim();
   if (!tpl) return { text: fallback, bucket: g.bucket };
 
   return { text: tpl.replace("{GREETING}", g.text), bucket: g.bucket };
 }
 
-// ===== Intent + Name helpers =====
-function normalizeForMatch(s) {
-  return (s || "")
-    .toString()
-    .replace(/[.,!?;:"'(){}\[\]<>]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
+// ===== Helpers (intent, kb detection, name) =====
+function normalize(s) {
+  return (s || "").toString().trim().toLowerCase();
 }
 
-function splitTriggers(triggers) {
-  // supports: comma, newline, | separators
-  const raw = (triggers || "").toString();
-  return raw
-    .split(/\r?\n|,|\|/g)
-    .map((t) => t.trim())
+function splitCommaList(s) {
+  return (s || "")
+    .toString()
+    .split(",")
+    .map((x) => x.trim())
     .filter(Boolean);
 }
 
-function detectIntentFromSSOT(ssot, transcript) {
-  const t = normalizeForMatch(transcript);
-  if (!t) return { intent: "other", matched: null };
-
-  const intents = (ssot?.ok ? ssot.intents : []) || [];
-  if (!intents.length) return { intent: "other", matched: null };
-
-  // sort by priority desc
-  const sorted = intents.slice().sort((a, b) => (b.priority || 0) - (a.priority || 0));
-
-  for (const row of sorted) {
-    const type = (row.trigger_type || "contains").toLowerCase();
-    const trigList = splitTriggers(row.triggers_he);
-
-    for (const trig of trigList) {
-      const trigN = normalizeForMatch(trig);
-      if (!trigN) continue;
-
-      if (type === "regex") {
-        try {
-          const re = new RegExp(trig, "i");
-          if (re.test(transcript)) return { intent: row.intent, matched: trig };
-        } catch {
-          // ignore invalid regex
-        }
-      } else if (type === "starts_with") {
-        if (t.startsWith(trigN)) return { intent: row.intent, matched: trig };
-      } else {
-        // contains (default)
-        if (t.includes(trigN)) return { intent: row.intent, matched: trig };
-      }
-    }
-  }
-
-  return { intent: "other", matched: null };
+function detectEnglishPreference(transcript) {
+  const s = (transcript || "").toString();
+  if (/[A-Za-z]/.test(s)) return true;
+  const t = s.toLowerCase();
+  if (t.includes("english") || t.includes("in english") || t.includes("speak english")) return true;
+  return false;
 }
 
 function looksLikeNameToken(tok) {
   if (!tok) return false;
   if (/\d/.test(tok)) return false;
-  // Allow Hebrew/English letters, avoid long phrases
   if (!/^[A-Za-z\u0590-\u05FF]{2,20}$/.test(tok)) return false;
-  const bad = ["אני", "שמי", "קוראים", "לי", "זה", "היי", "שלום", "כן", "לא", "בטי", "מרגריטה"];
+  const bad = ["אני", "שמי", "קוראים", "לי", "זה", "היי", "שלום", "כן", "לא", "בטי", "מרגריטה", "ריטה"];
   if (bad.includes(tok)) return false;
   return true;
 }
@@ -286,8 +255,6 @@ function extractNameSoft(transcript) {
   const raw = (transcript || "").toString().trim();
   if (!raw) return null;
 
-  // Patterns:
-  // "קוראים לי X", "שמי X", "אני X"
   const patterns = [
     /קוראים\s+לי\s+([A-Za-z\u0590-\u05FF]{2,20})/i,
     /שמי\s+([A-Za-z\u0590-\u05FF]{2,20})/i,
@@ -298,7 +265,6 @@ function extractNameSoft(transcript) {
     if (m && m[1] && looksLikeNameToken(m[1])) return m[1];
   }
 
-  // Single/first token fallback
   const toks = raw
     .replace(/[^\w\u0590-\u05FF\s]/g, " ")
     .replace(/\s+/g, " ")
@@ -307,31 +273,146 @@ function extractNameSoft(transcript) {
     .filter(Boolean);
 
   if (toks.length === 1 && looksLikeNameToken(toks[0])) return toks[0];
-
-  // First reasonable token
   for (const tok of toks.slice(0, 4)) {
     if (looksLikeNameToken(tok)) return tok;
+  }
+  return null;
+}
+
+// Explicit KB questions detection (aligned to KB_PROMPT + SETTINGS keys)
+function detectKbQuestion(transcript) {
+  const t = normalize(transcript);
+
+  const isHours = t.includes("שעות") || t.includes("שעות פעילות") || t.includes("מתי פתוח") || t.includes("מתי אתם פתוחים");
+  const isAddress = t.includes("כתובת") || t.includes("איפה אתם") || t.includes("איפה נמצאים") || t.includes("מיקום") || t.includes("ממוקמים");
+  const isPhone = t.includes("טלפון") || t.includes("מספר טלפון") || t.includes("מה המספר") || t.includes("להתקשר");
+  const isEmail = t.includes("מייל") || t.includes("אימייל") || t.includes('דוא"ל') || t.includes("דואר אלקטרוני");
+
+  const isBizDesc = t.includes("על העסק") || t.includes("על המשרד") || t.includes("מה אתם עושים") || t.includes("מה השירותים") || t.includes("שירותים") || t.includes("תיאור");
+  const isOwner = t.includes("מי הבעלים") || t.includes("מי מרגריטה") || t.includes("מי הבעלת") || t.includes("מי היועצת");
+  const isExperience = t.includes("ותק") || t.includes("כמה שנים");
+  const isExpertise = t.includes("תחומי") || t.includes("התמחות") || t.includes("במה אתם מתמחים");
+  const isRepresentation = t.includes("רשויות") || t.includes("מס הכנסה") || t.includes("ביטוח לאומי") || t.includes('מע"מ') || t.includes("ייצוג");
+  const isSpecialNotes = t.includes("הערות") || t.includes("מיוחד") || t.includes("איסוף חומר") || t.includes("הרשות הפלסטינאית");
+
+  // English minimal
+  const isHoursEn = t.includes("hours") || t.includes("working hours") || t.includes("open");
+  const isAddressEn = t.includes("address") || t.includes("location");
+  const isPhoneEn = t.includes("phone") || t.includes("phone number");
+  const isEmailEn = t.includes("email");
+
+  return {
+    isHours: isHours || isHoursEn,
+    isAddress: isAddress || isAddressEn,
+    isPhone: isPhone || isPhoneEn,
+    isEmail: isEmail || isEmailEn,
+    isBizDesc,
+    isOwner,
+    isExperience,
+    isExpertise,
+    isRepresentation,
+    isSpecialNotes,
+  };
+}
+
+function buildKbAnswerFromSettings(ssot, kb, userPrefEnglish) {
+  const s = ssot?.ok ? ssot.settings : {};
+  const noData = (s.NO_DATA_MESSAGE || "אין לי מידע זמין על זה כרגע.").trim();
+
+  const langHe = !userPrefEnglish;
+
+  const takeMessageQ = langHe
+    ? "מה תרצו שאמסור למרגריטה?"
+    : "What would you like me to pass to Margarita?";
+
+  const askNameQ = langHe ? "מה השם בבקשה?" : "What’s your name, please?";
+
+  const hours = (s.WORKING_HOURS || "").trim();
+  const address = (s.BUSINESS_ADDRESS || "").trim();
+  const phone = (s.MAIN_PHONE || "").trim();
+  const email = (s.BUSINESS_EMAIL || "").trim();
+
+  const businessDesc = (s.BUSINESS_DESCRIPTION || "").trim();
+  const services = (s.BUSINESS_SERVICES_LIST || "").trim();
+  const owner = (s.BUSINESS_OWNER || "").trim();
+  const expYears = (s.BUSINESS_EXPERIENCE_YEARS || "").trim();
+  const expertise = (s.BUSINESS_EXPERTISE || "").trim();
+  const representation = (s.BUSINESS_AUTHORITIES_REPRESENTATION || "").trim();
+  const specialNotes = (s.BUSINESS_SPECIAL_NOTES || "").trim();
+
+  function lineOrNoData(labelHe, labelEn, val) {
+    if (!val) return langHe ? noData : "I don’t have that information right now.";
+    return langHe ? `${labelHe}: ${val}.` : `${labelEn}: ${val}.`;
+  }
+
+  // Office info
+  if (kb.isHours) return { exact: `${lineOrNoData("שעות הפעילות", "Working hours", hours)} ${takeMessageQ}` };
+  if (kb.isAddress) return { exact: `${lineOrNoData("הכתובת", "Address", address)} ${takeMessageQ}` };
+  if (kb.isPhone) return { exact: `${lineOrNoData("מספר הטלפון", "Phone number", phone)} ${takeMessageQ}` };
+  if (kb.isEmail) return { exact: `${lineOrNoData("האימייל", "Email", email)} ${takeMessageQ}` };
+
+  // Business info (allowed ONLY if asked explicitly — this detector is that)
+  if (kb.isOwner) return { exact: `${lineOrNoData("בעלת המשרד", "Office owner", owner)} ${takeMessageQ}` };
+  if (kb.isExperience) return { exact: `${lineOrNoData("ותק", "Experience", expYears)} ${takeMessageQ}` };
+  if (kb.isExpertise) return { exact: `${lineOrNoData("תחומי התמחות", "Expertise", expertise)} ${takeMessageQ}` };
+  if (kb.isRepresentation) return { exact: `${lineOrNoData("ייצוג מול רשויות", "Representation", representation)} ${takeMessageQ}` };
+  if (kb.isSpecialNotes) return { exact: `${lineOrNoData("הערות מיוחדות", "Special notes", specialNotes)} ${takeMessageQ}` };
+
+  if (kb.isBizDesc) {
+    // Keep short: description + optionally services in one breath if asked broadly
+    const parts = [];
+    if (businessDesc) parts.push(langHe ? businessDesc : businessDesc);
+    if (services) parts.push(langHe ? `שירותים מרכזיים: ${services}` : `Main services: ${services}`);
+    const merged = parts.length ? parts.join(". ") + "." : (langHe ? noData : "I don’t have that information right now.");
+    // Return to flow: ask name if missing, else ask for message
+    return { exact: `${merged} ${askNameQ}` };
   }
 
   return null;
 }
 
-function detectEnglishPreference(transcript) {
-  const s = (transcript || "").toString();
-  if (/[A-Za-z]/.test(s)) return true;
-  const t = s.toLowerCase();
-  if (t.includes("english") || t.includes("speak english") || t.includes("in english")) return true;
-  return false;
-}
+// INTENT detection aligned to sheet
+function detectIntentFromSheet(ssot, transcript, kb) {
+  // Hard override: contact info questions => ask_contact_info
+  if (kb?.isHours || kb?.isAddress || kb?.isPhone || kb?.isEmail) {
+    return { intent: "ask_contact_info", matched: "kb_office_info" };
+  }
 
-// ===== Preload SSOT on boot + periodic refresh =====
-(async () => {
-  const ssot = await loadSSOT(true);
-  console.log("[SSOT] preload", { ok: ssot.ok, error: ssot.error || null });
-  setInterval(() => {
-    loadSSOT(false).catch(() => {});
-  }, SSOT_REFRESH_MS).unref();
-})();
+  const t = normalize(transcript);
+  const intents = (ssot?.ok ? ssot.intents : []) || [];
+  if (!intents.length) return { intent: "other", matched: null };
+
+  const sorted = intents.slice().sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+  // First pass: keyword/phrase matching
+  for (const row of sorted) {
+    const type = normalize(row.trigger_type);
+    if (type !== "keyword" && type !== "phrase") continue;
+
+    const triggers = splitCommaList(row.triggers_he);
+    for (const trig of triggers) {
+      const tn = normalize(trig);
+      if (!tn) continue;
+
+      if (type === "keyword") {
+        if (t.includes(tn)) return { intent: row.intent, matched: trig };
+      } else {
+        // phrase: still "contains" but longer phrases
+        if (t.includes(tn)) return { intent: row.intent, matched: trig };
+      }
+    }
+  }
+
+  // default
+  const def = sorted.find((x) => normalize(x.trigger_type) === "default");
+  if (def) return { intent: def.intent, matched: "default" };
+
+  // fallback
+  const fb = sorted.find((x) => normalize(x.trigger_type) === "fallback");
+  if (fb) return { intent: fb.intent, matched: "fallback" };
+
+  return { intent: "other", matched: null };
+}
 
 // ===== Express =====
 const app = express();
@@ -362,47 +443,44 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs) => {
-  console.log("[WS] connection established");
-
   let streamSid = null;
   let callSid = null;
 
-  // OpenAI session readiness gates
+  const logp = (...args) => {
+    const prefix = callSid ? `[CALL ${callSid}]` : "[CALL -]";
+    console.log(prefix, ...args);
+  };
+  const loge = (...args) => {
+    const prefix = callSid ? `[CALL ${callSid}]` : "[CALL -]";
+    console.error(prefix, ...args);
+  };
+
+  logp("[WS] connection established");
+
+  const state = {
+    name: null,
+    user_prefers_english: false,
+    last_user_transcript_final: "",
+    intent: "other",
+    intentMatched: null,
+    greeting_time_bucket: getGreetingBucketAndText().bucket,
+  };
+
   let openaiReady = false;
   let sessionConfigured = false;
 
-  // Turn-taking
-  let pendingCreate = false;
-  let responseInFlight = false;
   let openingLock = true;
+
+  let responseInFlight = false; // IMPORTANT: released ONLY on response.completed
   let lastResponseCreateAt = 0;
   let userFramesSinceLastCreate = 0;
 
-  // Conversation state (in-memory for this call)
-  const state = {
-    name: null,
-    nameAskedCount: 0,
-    intent: "other",
-    intentMatched: null,
-    asked_for_margarita: false,
-    callback_requested: false,
-    contact_info_requested: false,
-    reports_details: "",
-    message: "",
-    user_prefers_english: false,
-    greeting_time_bucket: getGreetingBucketAndText().bucket,
-    last_user_transcript: "",
-  };
-
-  // Queue Twilio audio until OpenAI WS is ready
   const audioQueue = [];
   const MAX_QUEUE_FRAMES = 400;
 
-  // Outbound audio buffer until streamSid known
   const outAudioQueue = [];
   const MAX_OUT_QUEUE_FRAMES = 400;
 
-  // Assistant text accumulation for logs
   let assistantTextBuf = "";
 
   function safeSend(ws, obj) {
@@ -411,7 +489,7 @@ wss.on("connection", (twilioWs) => {
       ws.send(JSON.stringify(obj));
       return true;
     } catch (e) {
-      console.error("[OPENAI] send failed", e && (e.message || e));
+      loge("[OPENAI] send failed", e && (e.message || e));
       return false;
     }
   }
@@ -431,57 +509,31 @@ wss.on("connection", (twilioWs) => {
     while (outAudioQueue.length) {
       const payload = outAudioQueue.shift();
       try {
-        twilioWs.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload },
-          })
-        );
+        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
       } catch (e) {
-        console.error("[TWILIO] send media failed (flush)", e && (e.message || e));
+        loge("[TWILIO] send media failed (flush)", e && (e.message || e));
         return;
       }
     }
   }
 
-  function buildTurnInstructions(ssot) {
-    // Use SSOT prompts as base system policy (already in session.instructions),
-    // and inject state as "local" constraints for THIS response.
-    const lang = state.user_prefers_english ? "en" : "he";
-    const nameKnown = !!state.name;
+  function forceExactUtterance(openaiWs, exactText, reason) {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    if (!openaiReady || !sessionConfigured) return;
 
-    // Minimal deterministic business logic for this stage
-    const leadGate = nameKnown
-      ? (lang === "he"
-          ? `השם של המתקשר כבר ידוע: "${state.name}". אל תשאלי שוב על השם.`
-          : `Caller name is known: "${state.name}". Do NOT ask again for the name.`)
-      : (lang === "he"
-          ? `חובה לאסוף שם (שם פרטי מספיק). אם אין שם עדיין, בקשי שם בצורה קצרה וברורה.`
-          : `You must collect the caller's name (first name is enough). If missing, ask for the name briefly.`);
+    responseInFlight = true;
+    lastResponseCreateAt = Date.now();
+    assistantTextBuf = "";
 
-    const intentLine =
-      lang === "he"
-        ? `הכוונה הנוכחית: ${state.intent} (matched: ${state.intentMatched || "none"}).`
-        : `Current intent: ${state.intent} (matched: ${state.intentMatched || "none"}).`;
+    safeSend(openaiWs, {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions: `אמרי מילה במילה בדיוק את המשפט הבא, בלי להוסיף ובלי לשנות אף מילה: ${exactText}`,
+      },
+    });
 
-    const styleLine =
-      lang === "he"
-        ? `סגנון: קצר, אנושי, אנרגטי, שאלה אחת בלבד בסוף. בלי אימוג'ים.`
-        : `Style: short, human, upbeat. Exactly one question at the end. No emojis.`;
-
-    const taskLine =
-      lang === "he"
-        ? `מטרה: להבין מה הלקוח צריך, ואם צריך—לקחת הודעה למרגריטה.`
-        : `Goal: understand what the caller needs and, if needed, take a message for Margarita.`;
-
-    // Avoid hallucinating office info: already in GUARDRAILS/KB, keep reminder
-    const kbReminder =
-      lang === "he"
-        ? `מידע משרדי (שעות/כתובת/טלפון/מייל) מוסרים רק אם נשאלים במפורש ורק מ-SETTINGS.`
-        : `Office info (hours/address/phone/email) only if explicitly asked and only from SETTINGS.`;
-
-    return [leadGate, intentLine, taskLine, kbReminder, styleLine].join(" ");
+    logp("[TURN] forced exact response.create", reason || "forced");
   }
 
   function maybeCreateResponse(openaiWs, reason) {
@@ -489,37 +541,84 @@ wss.on("connection", (twilioWs) => {
 
     if (openingLock) return;
     if (responseInFlight) return;
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) return;
 
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
-      pendingCreate = true;
-      return;
-    }
-
-    const DEBOUNCE_MS = 1200;
+    const DEBOUNCE_MS = 900;
     const MIN_FRAMES = 8;
-
     if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
     if (userFramesSinceLastCreate < MIN_FRAMES) return;
 
     lastResponseCreateAt = now;
     userFramesSinceLastCreate = 0;
 
-    // Per-turn instructions for orchestration
     const ssot = ssotCache;
-    const turnInstructions = buildTurnInstructions(ssot);
 
+    // 1) Deterministic KB answers from SETTINGS if explicitly asked
+    const kb = detectKbQuestion(state.last_user_transcript_final);
+    const kbAns = buildKbAnswerFromSettings(ssot, kb, state.user_prefers_english);
+    if (kbAns?.exact) {
+      // After giving KB info: if name missing, ask name (one question)
+      if (!state.name) {
+        // kbAns already ends with flow question; but for office info we want message flow, not name gate.
+        // MASTER says opening asks name; if they evade, we can circle back later. Here keep it human:
+        // Ask name only if the KB answer didn't already ask a question about the message.
+      }
+      forceExactUtterance(openaiWs, kbAns.exact, "kb_from_settings");
+      // Set intent for contact info if it was office info
+      if (kb.isHours || kb.isAddress || kb.isPhone || kb.isEmail) {
+        state.intent = "ask_contact_info";
+        state.intentMatched = "kb_office_info";
+      }
+      return;
+    }
+
+    // 2) Intent from INTENTS sheet (aligned to their trigger_type semantics)
+    const det = detectIntentFromSheet(ssot, state.last_user_transcript_final, kb);
+    state.intent = det.intent || "other";
+    state.intentMatched = det.matched || null;
+
+    // 3) Lead Gate (name required before any “closing/hand-off”; here we enforce when we need to proceed)
+    // If name missing, ask for name exactly (short).
+    if (!state.name) {
+      const ask = state.user_prefers_english
+        ? "Hi, I’m Betty, Margarita’s assistant. What’s your name, please?"
+        : "היי, אני בטי, העוזרת של מרגריטה. מה השם בבקשה?";
+      forceExactUtterance(openaiWs, ask, "lead_gate_name");
+      return;
+    }
+
+    // 4) Special handling: reach_margarita => consistent line, then one open question
+    if (state.intent === "reach_margarita") {
+      const line = state.user_prefers_english
+        ? `Margarita is currently busy, but I can help and pass everything accurately. What would you like me to tell her, ${state.name}?`
+        : `מרגריטה עסוקה כרגע, אבל אני כאן לעזור ולהעביר הכול במדויק. מה תרצו שאמסור לה, ${state.name}?`;
+      forceExactUtterance(openaiWs, line, "reach_margarita");
+      return;
+    }
+
+    // 5) Special handling: reports_request => ask for details (one question)
+    if (state.intent === "reports_request") {
+      const q = state.user_prefers_english
+        ? `Sure, ${state.name}. Which reports do you need, for which period, and who are they for?`
+        : `בטח ${state.name}. איזה דוחות צריך, לאיזו תקופה, ולמי הם מיועדים?`;
+      forceExactUtterance(openaiWs, q, "reports_request");
+      return;
+    }
+
+    // 6) Default: let model respond but with strict constraints for this turn
+    responseInFlight = true;
     assistantTextBuf = "";
+
+    const turnInstructions = state.user_prefers_english
+      ? `You are Betty, Margarita’s assistant. Caller name is "${state.name}". Be short, upbeat, and service-oriented. Ask exactly ONE question at the end. Do NOT invent any office/business info; only use SETTINGS if explicitly asked.`
+      : `את בטי, העוזרת של מרגריטה. שם המתקשר הוא "${state.name}". תשובה קצרה, אנושית ושירותית, ושאלה אחת בלבד בסוף. אין להמציא מידע; מידע משרדי/עסקי רק אם נשאלו במפורש ורק מתוך SETTINGS.`;
+
     safeSend(openaiWs, {
       type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions: turnInstructions,
-      },
+      response: { modalities: ["audio", "text"], instructions: turnInstructions },
     });
 
-    pendingCreate = false;
-    responseInFlight = true;
-    console.log("[TURN] response.create", reason || "speech_stopped");
+    logp("[TURN] response.create", reason || "speech_stopped", { intent: state.intent, matched: state.intentMatched });
   }
 
   const openaiWs = new WebSocket(
@@ -533,7 +632,7 @@ wss.on("connection", (twilioWs) => {
   );
 
   openaiWs.on("open", () => {
-    console.log("[OPENAI] ws open");
+    logp("[OPENAI] ws open");
     openaiReady = true;
 
     const ssot = ssotCache;
@@ -554,7 +653,6 @@ wss.on("connection", (twilioWs) => {
       max_response_output_tokens: "inf",
     };
 
-    // Enable STT (needed for transcript logs + intent/name)
     if (MB_TRANSCRIPTION_MODEL) {
       session.input_audio_transcription = {
         model: MB_TRANSCRIPTION_MODEL,
@@ -565,35 +663,28 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // Opening (exact, no paraphrase)
+    // Opening exact (from SETTINGS.OPENING_SCRIPT)
     const openingObj = buildOpeningFromSSOT(ssot);
-    const openingText = openingObj.text;
+    state.greeting_time_bucket = openingObj.bucket;
 
     openingLock = true;
     responseInFlight = true;
     lastResponseCreateAt = Date.now();
-    userFramesSinceLastCreate = 0;
 
-    // Context item (light)
     safeSend(openaiWs, {
       type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "התחילי בפתיח." }],
-      },
+      item: { type: "message", role: "user", content: [{ type: "input_text", text: "התחילי בפתיח." }] },
     });
 
     safeSend(openaiWs, {
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
-        instructions: `אמרי מילה במילה בדיוק את המשפט הבא, בלי להוסיף ובלי לשנות אף מילה: ${openingText}`,
+        instructions: `אמרי מילה במילה בדיוק את המשפט הבא, בלי להוסיף ובלי לשנות אף מילה: ${openingObj.text}`,
       },
     });
 
     flushAudioQueue(openaiWs);
-    if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
 
   openaiWs.on("message", (raw) => {
@@ -604,92 +695,87 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // Turn boundary
+    // DO NOT cancel during opening (prevents cutting opening due to noise)
+    if (msg.type === "input_audio_buffer.speech_started") {
+      if (!openingLock && responseInFlight) {
+        safeSend(openaiWs, { type: "response.cancel" });
+        // responseInFlight will be released on response.completed OR we force-release here to allow next create
+        responseInFlight = false;
+        assistantTextBuf = "";
+        logp("[TURN] response.cancel (barge-in)");
+      }
+      return;
+    }
+
     if (msg.type === "input_audio_buffer.speech_stopped") {
       maybeCreateResponse(openaiWs, "speech_stopped");
       return;
     }
 
-    // Handle STT events (best-effort across event variants)
-    // We extract text from common shapes and update state.last_user_transcript.
-    if (MB_LOG_TRANSCRIPTS && typeof msg.type === "string" && msg.type.includes("transcription")) {
+    // STT: accept only FINAL/completed (varies by model; we gate by "completed" keyword)
+    if (
+      MB_LOG_TRANSCRIPTS &&
+      typeof msg.type === "string" &&
+      msg.type.includes("transcription") &&
+      msg.type.includes("completed")
+    ) {
       const text =
         msg.transcript ||
         msg.text ||
         msg?.item?.content?.[0]?.transcript ||
         msg?.item?.content?.[0]?.text ||
-        msg?.delta ||
+        msg?.transcription ||
         null;
 
       if (text && typeof text === "string") {
-        // Keep only meaningful, non-empty
         const cleaned = text.trim();
         if (cleaned) {
-          state.last_user_transcript = cleaned;
-          state.user_prefers_english = state.user_prefers_english || detectEnglishPreference(cleaned);
+          state.last_user_transcript_final = cleaned;
+          state.user_prefers_english =
+            (ssotCache?.settings?.AUTO_EN_ENABLED || "").toString().toLowerCase() === "true"
+              ? (state.user_prefers_english || detectEnglishPreference(cleaned))
+              : state.user_prefers_english;
 
-          // Update name (Lead Gate)
+          logp("[STT][USER]", cleaned);
+
           if (!state.name) {
-            const maybeName = extractNameSoft(cleaned);
-            if (maybeName) {
-              state.name = maybeName;
-              console.log("[LEAD] name captured:", state.name);
+            const nm = extractNameSoft(cleaned);
+            if (nm) {
+              state.name = nm;
+              logp("[LEAD] name captured:", state.name);
             }
           }
-
-          // Update intent
-          const det = detectIntentFromSSOT(ssotCache, cleaned);
-          state.intent = det.intent || "other";
-          state.intentMatched = det.matched || null;
-
-          // Minimal flags
-          if (state.intent === "reach_margarita") state.asked_for_margarita = true;
-          if (state.intent === "callback_request") state.callback_requested = true;
-          if (state.intent === "ask_contact_info") state.contact_info_requested = true;
-          if (state.intent === "reports_request") state.reports_details = cleaned;
-
-          // message capture (for now keep last meaningful user statement)
-          state.message = cleaned;
-
-          console.log("[STT][USER]", cleaned);
         }
       }
+      return;
     }
 
     // Assistant text accumulation (best-effort)
-    if (MB_LOG_ASSISTANT_TEXT && typeof msg.type === "string" && msg.type.includes("text") && msg.delta) {
-      if (typeof msg.delta === "string") assistantTextBuf += msg.delta;
-    }
-    if (MB_LOG_ASSISTANT_TEXT && typeof msg.type === "string" && msg.type.endsWith(".delta") && msg.text) {
-      if (typeof msg.text === "string") assistantTextBuf += msg.text;
+    if (MB_LOG_ASSISTANT_TEXT) {
+      if (typeof msg.type === "string" && msg.type.includes("text") && typeof msg.delta === "string") {
+        assistantTextBuf += msg.delta;
+      }
+      if (typeof msg.type === "string" && msg.type.endsWith(".delta") && typeof msg.text === "string") {
+        assistantTextBuf += msg.text;
+      }
     }
 
-    // OpenAI error
     if (msg.type === "error") {
-      console.error("[OPENAI] error event", msg);
+      loge("[OPENAI] error event", msg);
       responseInFlight = false;
       openingLock = false;
       return;
     }
 
-    // Response done => unlock
-    if (msg.type === "response.audio.done" || msg.type === "response.completed") {
+    // IMPORTANT: release ONLY on response.completed
+    if (msg.type === "response.completed") {
       responseInFlight = false;
-
-      if (openingLock) {
-        openingLock = false;
-        // After opening, if still no name, we will let next user turn trigger name gate.
-      }
+      if (openingLock) openingLock = false;
 
       if (MB_LOG_ASSISTANT_TEXT) {
         const t = (assistantTextBuf || "").trim();
-        if (t) console.log("[LLM][ASSISTANT]", t.slice(0, 800));
+        if (t) logp("[LLM][ASSISTANT]", t.slice(0, 800));
         assistantTextBuf = "";
-      }
-
-      if (pendingCreate) {
-        pendingCreate = false;
-        maybeCreateResponse(openaiWs, "pending_after_completed");
       }
       return;
     }
@@ -708,15 +794,9 @@ wss.on("connection", (twilioWs) => {
       }
 
       try {
-        twilioWs.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload },
-          })
-        );
+        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
       } catch (e) {
-        console.error("[TWILIO] send media failed", e && (e.message || e));
+        loge("[TWILIO] send media failed", e && (e.message || e));
       }
     }
   });
@@ -724,16 +804,16 @@ wss.on("connection", (twilioWs) => {
   openaiWs.on("error", (e) => {
     responseInFlight = false;
     openingLock = false;
-    console.error("[OPENAI] ws error", e && (e.message || e));
+    loge("[OPENAI] ws error", e && (e.message || e));
   });
 
   openaiWs.on("close", (code, reason) => {
     responseInFlight = false;
     openingLock = false;
-    console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
+    logp("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
-  // ===== Twilio WS inbound =====
+  // Twilio inbound
   twilioWs.on("message", (raw) => {
     let msg;
     try {
@@ -742,22 +822,21 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    if (msg.event && msg.event !== "media") {
-      console.log("[TWILIO] event", msg.event);
+    if (MB_DEBUG_TWILIO_EVENTS && msg.event && msg.event !== "media") {
+      logp("[TWILIO] event", msg.event);
     }
 
-    // Fallback: derive streamSid from top-level msg.streamSid
     if (!streamSid && msg.streamSid) {
       streamSid = msg.streamSid;
-      console.log("[WS] streamSid derived from msg.streamSid", streamSid);
+      logp("[WS] streamSid derived from msg.streamSid", streamSid);
       flushOutAudioToTwilio();
     }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || streamSid || null;
       callSid = msg.start?.callSid || null;
-      console.log("[WS] start", {
-        accountSid: msg.start?.accountSid,
+
+      logp("[WS] start", {
         streamSid,
         callSid,
         tracks: msg.start?.tracks,
@@ -773,10 +852,9 @@ wss.on("connection", (twilioWs) => {
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      // Derive streamSid from media if needed
       if (!streamSid && msg.streamSid) {
         streamSid = msg.streamSid;
-        console.log("[WS] streamSid derived from media", streamSid);
+        logp("[WS] streamSid derived from media", streamSid);
         flushOutAudioToTwilio();
       }
 
@@ -788,21 +866,13 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // Count audio frames for gating
       userFramesSinceLastCreate += 1;
-
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
       return;
     }
 
     if (msg.event === "stop") {
-      if (!streamSid && msg.streamSid) {
-        streamSid = msg.streamSid;
-        console.log("[WS] streamSid derived from stop", streamSid);
-        flushOutAudioToTwilio();
-      }
-
-      console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
+      logp("[WS] stop", { callSid: msg.stop?.callSid || callSid });
       try {
         if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
       } catch {}
@@ -811,14 +881,14 @@ wss.on("connection", (twilioWs) => {
   });
 
   twilioWs.on("close", () => {
-    console.log("[WS] closed");
+    logp("[WS] closed");
     try {
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_close");
     } catch {}
   });
 
   twilioWs.on("error", (e) => {
-    console.error("[TWILIO] ws error", e && (e.message || e));
+    loge("[TWILIO] ws error", e && (e.message || e));
     try {
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1011, "twilio_error");
     } catch {}
