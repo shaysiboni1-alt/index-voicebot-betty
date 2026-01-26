@@ -1,186 +1,103 @@
-/**
- * Index Betty VoiceBot – Server Skeleton (CommonJS)
- * Stage 1: Infrastructure only (NO AI, NO intents, NO lead logic)
- *
- * Includes:
- * - GET /health
- * - POST /twilio-voice (optional TwiML entry)
- * - WS /twilio-media-stream (Twilio Media Streams)
- * - Call lifecycle handling (start / stop)
- * - CALL_LOG webhook on call end (with logs + timeout)
- */
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 
+const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 10000;
 
-// Support both names to avoid ENV mismatch mistakes
-const CALL_LOG_WEBHOOK =
-  (process.env.CALL_LOG_WEBHOOK_URL || "").trim() ||
-  (process.env.MB_CALL_LOG_WEBHOOK_URL || "").trim() ||
-  "";
+// ---- In-memory call state ----
+const calls = new Map();
 
-function nowIso() {
+function nowISO() {
   return new Date().toISOString();
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: ctrl.signal });
-    return res;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
-
-/* =========================
-   Health
-========================= */
-app.get("/health", (_req, res) => {
+// ---- Health ----
+app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "index-betty-voicebot",
-    ts: nowIso(),
-    call_log_webhook_configured: !!CALL_LOG_WEBHOOK,
+    ts: nowISO(),
+    call_log_webhook_configured: !!process.env.CALL_LOG_WEBHOOK_URL,
+    provider_mode: process.env.PROVIDER_MODE || null,
   });
 });
 
-/* =========================
-   Optional Twilio Voice Entry (TwiML)
-========================= */
-app.post("/twilio-voice", (req, res) => {
-  const wsUrl =
-    process.env.TWILIO_STREAM_WS_URL ||
-    "wss://index-voicebot-betty.onrender.com/twilio-media-stream";
-
-  const from = req.body.From || "";
-  const to = req.body.To || "";
-  const callSid = req.body.CallSid || "";
-
-  const twiml = `
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}">
-      <Parameter name="caller" value="${from}" />
-      <Parameter name="called" value="${to}" />
-      <Parameter name="callSid" value="${callSid}" />
-      <Parameter name="source" value="Index Betty Voice AI" />
-    </Stream>
-  </Connect>
-</Response>`.trim();
-
-  res.type("text/xml").send(twiml);
-});
-
-/* =========================
-   HTTP + WS Server
-========================= */
+// ---- HTTP server ----
 const server = http.createServer(app);
+
+// ---- WebSocket server (Twilio Media Streams) ----
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
-
-/**
- * In-memory call sessions
- * callSid => { startedAt, caller, called, source }
- */
-const calls = new Map();
-
-async function sendCallLog(session, endedAtMs) {
-  if (!CALL_LOG_WEBHOOK) {
-    console.log("[CALL_LOG] skipped (no webhook configured)");
-    return;
-  }
-
-  const durationSec = Math.max(0, Math.round((endedAtMs - session.startedAt) / 1000));
-  const payload = {
-    event: "CALL_LOG",
-    callSid: session.callSid,
-    caller: session.caller,
-    called: session.called,
-    started_at: new Date(session.startedAt).toISOString(),
-    ended_at: new Date(endedAtMs).toISOString(),
-    duration_sec: durationSec,
-    source: session.source,
-  };
-
-  try {
-    console.log("[CALL_LOG] sending...", { callSid: session.callSid });
-    const res = await fetchWithTimeout(
-      CALL_LOG_WEBHOOK,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-      4500
-    );
-    const txt = await res.text().catch(() => "");
-    if (!res.ok) {
-      console.log("[CALL_LOG] failed", { status: res.status, body: txt?.slice(0, 200) || "" });
-      return;
-    }
-    console.log("[CALL_LOG] delivered", { status: res.status });
-  } catch (e) {
-    console.log("[CALL_LOG] error", e && (e.message || e));
-  }
-}
 
 wss.on("connection", (ws) => {
   console.log("[WS] connection established");
 
-  ws.on("message", async (raw) => {
-    let msg;
+  ws.on("message", async (msg) => {
+    let data;
     try {
-      msg = JSON.parse(raw.toString());
+      data = JSON.parse(msg.toString());
     } catch {
       return;
     }
 
-    if (msg.event === "start" && msg.start) {
-      const { callSid, customParameters } = msg.start;
-
+    if (data.event === "start") {
+      const { callSid, streamSid, customParameters } = data.start || {};
       calls.set(callSid, {
         callSid,
-        startedAt: Date.now(),
-        caller: customParameters?.caller || null,
-        called: customParameters?.called || null,
-        source: customParameters?.source || null,
+        streamSid,
+        started_at: nowISO(),
+        media_frames: 0,
+        customParameters: customParameters || {},
       });
-
-      console.log("[WS] start", msg.start);
-      return;
+      console.log("[WS] start", data.start);
     }
 
-    if (msg.event === "stop" && msg.stop) {
-      const callSid = msg.stop.callSid;
-      const session = calls.get(callSid);
-
-      console.log("[WS] stop", msg.stop);
-
-      if (session) {
-        const endedAt = Date.now();
-        await sendCallLog(session, endedAt);
-        calls.delete(callSid);
-      } else {
-        console.log("[CALL_LOG] no session found for callSid", callSid);
+    if (data.event === "media") {
+      const callSid = data.streamSid && [...calls.values()].find(c => c.streamSid === data.streamSid)?.callSid;
+      if (callSid && calls.has(callSid)) {
+        calls.get(callSid).media_frames += 1;
       }
-      return;
+    }
+
+    if (data.event === "stop") {
+      const { callSid } = data.stop || {};
+      const state = calls.get(callSid);
+      console.log("[WS] stop", data.stop);
+
+      if (state && process.env.CALL_LOG_WEBHOOK_URL) {
+        try {
+          console.log("[CALL_LOG] sending...", { callSid });
+          await fetch(process.env.CALL_LOG_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              event: "CALL_LOG",
+              callSid,
+              started_at: state.started_at,
+              ended_at: nowISO(),
+              media_frames: state.media_frames,
+              provider_mode: process.env.PROVIDER_MODE || null,
+              customParameters: state.customParameters || {},
+            }),
+          });
+          console.log("[CALL_LOG] delivered");
+        } catch (e) {
+          console.log("[CALL_LOG] failed", e && (e.message || e));
+        }
+      }
+
+      calls.delete(callSid);
     }
   });
 
   ws.on("close", (code, reason) => {
-    console.log("[WS] closed", { code, reason: reason?.toString() });
+    console.log("[WS] closed", { code, reason: reason && reason.toString() });
   });
 });
 
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-  console.log(`[BOOT] call_log_webhook_configured=${!!CALL_LOG_WEBHOOK}`);
 });
