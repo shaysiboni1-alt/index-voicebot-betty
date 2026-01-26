@@ -77,6 +77,9 @@ wss.on("connection", (twilioWs) => {
   let sessionConfigured = false;    // after we send session.update
   let pendingCreate = false;        // if we got speech_stopped before ready
   let responseInFlight = false;    // prevent duplicate response.create
+  let lastResponseCreateAt = 0;
+  let userFramesSinceLastCreate = 0;
+  let lastUserAudioAt = 0;
         // if we got speech_stopped before ready
 
   // Queue Twilio audio until OpenAI WS is ready
@@ -99,23 +102,43 @@ wss.on("connection", (twilioWs) => {
     if (!openaiReady || !sessionConfigured) return;
     while (audioQueue.length) {
       const payload = audioQueue.shift();
+      // Count inbound audio frames to gate turn-taking.
+      userFramesSinceLastCreate += 1;
+      lastUserAudioAt = Date.now();
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
     }
   }
 
   function maybeCreateResponse(openaiWs, reason) {
-    // Guard against duplicate triggers (OpenAI may emit multiple speech_stopped events).
+    // Debounce + minimum-audio gate to avoid duplicate responses on multiple speech_stopped events.
+    const now = Date.now();
+
+    // If we already created a response and it's still in flight, do nothing.
     if (responseInFlight) return;
 
+    // Require the OpenAI WS to be fully ready; otherwise defer once.
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
       return;
     }
 
+    // Hard debounce window (ms) – prevents back-to-back response.create from rapid events.
+    const DEBOUNCE_MS = 1200;
+
+    // Minimum number of Twilio audio frames received since the last create.
+    // Twilio Media Streams typically send 20ms frames; 8 frames ~= 160ms of speech.
+    const MIN_FRAMES = 8;
+
+    if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
+    if (userFramesSinceLastCreate < MIN_FRAMES) return;
+
+    lastResponseCreateAt = now;
+    userFramesSinceLastCreate = 0;
+
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
     responseInFlight = true;
-    if (reason) console.log("[TURN] response.create", reason);
+    console.log("[TURN] response.create", reason || "speech_stopped");
   }
 
   const openaiWs = new WebSocket(
