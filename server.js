@@ -76,6 +76,8 @@ wss.on("connection", (twilioWs) => {
   let openaiReady = false;          // WS open
   let sessionConfigured = false;    // after we send session.update
   let pendingCreate = false;        // if we got speech_stopped before ready
+  let responseInFlight = false;    // prevent duplicate response.create
+        // if we got speech_stopped before ready
 
   // Queue Twilio audio until OpenAI WS is ready
   const audioQueue = [];
@@ -102,12 +104,17 @@ wss.on("connection", (twilioWs) => {
   }
 
   function maybeCreateResponse(openaiWs, reason) {
+    // Guard against duplicate triggers (OpenAI may emit multiple speech_stopped events).
+    if (responseInFlight) return;
+
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
       return;
     }
+
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
+    responseInFlight = true;
     if (reason) console.log("[TURN] response.create", reason);
   }
 
@@ -190,7 +197,14 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    if (msg.type === "response.audio.delta" && streamSid) {
+    
+
+    // When the model finished speaking, allow the next user turn to trigger a new response.
+    if (msg.type === "response.audio.done" || msg.type === "response.completed") {
+      responseInFlight = false;
+      return;
+    }
+if (msg.type === "response.audio.delta" && streamSid) {
       try {
         twilioWs.send(
           JSON.stringify({
@@ -206,10 +220,12 @@ wss.on("connection", (twilioWs) => {
   });
 
   openaiWs.on("error", (e) => {
+    responseInFlight = false;
     console.error("[OPENAI] ws error", e && (e.message || e));
   });
 
   openaiWs.on("close", (code, reason) => {
+    responseInFlight = false;
     console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
