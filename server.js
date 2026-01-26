@@ -1,12 +1,11 @@
 // server.js
 // Index Betty – Realtime VoiceBot (OpenAI only)
-// BASELINE: user's server_fixed.js (tested)
-// FIXES:
-// 1) Preload SSOT at server startup (no per-call cold load) + periodic refresh.
-// 2) Force EXACT opening line (no paraphrase) via response.create.response.instructions.
-// 3) Prevent conversation_already_has_active_response by locking speech_stopped until opening finished.
-// 4) Add transcription logging (if MB_TRANSCRIPTION_MODEL enabled).
-// 5) Keep Twilio streamSid fallback (derive from msg.streamSid) to avoid "no audio".
+// LOCKED baseline preserved: SSOT preload, exact opening, queues, streamSid fallback, VAD turn-taking.
+// Added in this stage:
+// - STT transcription logging (user) + assistant text logging
+// - Intent detection from SSOT INTENTS
+// - Lead Gate: name required (soft validation), never ask again after captured
+// - Turn orchestration via response.create.response.instructions per turn
 
 const express = require("express");
 const http = require("http");
@@ -21,7 +20,7 @@ const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
-const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
+const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // required for STT logs
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
 
 const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
@@ -32,7 +31,11 @@ const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
 const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
 const SSOT_CACHE_TTL_MS = Number(process.env.SSOT_CACHE_TTL_MS || 60_000);
-const SSOT_REFRESH_MS = Number(process.env.SSOT_REFRESH_MS || 60_000); // background refresh cadence
+const SSOT_REFRESH_MS = Number(process.env.SSOT_REFRESH_MS || 60_000);
+
+// Debug
+const MB_LOG_TRANSCRIPTS = String(process.env.MB_LOG_TRANSCRIPTS || "true").toLowerCase() === "true";
+const MB_LOG_ASSISTANT_TEXT = String(process.env.MB_LOG_ASSISTANT_TEXT || "true").toLowerCase() === "true";
 
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
@@ -125,13 +128,16 @@ async function loadSSOT(force = false) {
     });
 
     const intentsRows = await readRange(sheets, "INTENTS!A:E");
-    const intents = intentsRows.slice(1).map((row) => ({
-      intent: row[0],
-      priority: Number(row[1] || 0),
-      trigger_type: row[2],
-      triggers_he: row[3],
-      notes: row[4],
-    }));
+    const intents = intentsRows
+      .slice(1)
+      .map((row) => ({
+        intent: (row[0] || "").toString().trim(),
+        priority: Number(row[1] || 0),
+        trigger_type: (row[2] || "").toString().trim(),
+        triggers_he: (row[3] || "").toString().trim(),
+        notes: (row[4] || "").toString().trim(),
+      }))
+      .filter((x) => x.intent);
 
     const intentSuggestionsRows = await readRange(sheets, "INTENT_SUGGESTIONS!A:F");
     const intentSuggestions = intentSuggestionsRows.slice(1).map((row) => ({
@@ -173,7 +179,7 @@ async function loadSSOT(force = false) {
 }
 
 function buildInstructionsFromSSOT(ssot) {
-  // Baseline fallback (exactly as your tested code)
+  // Baseline fallback (kept)
   const fallback = [
     "את בטי, בוטית קולית נשית, אנרגטית, שמחה ושנונה.",
     "מדברת עברית טבעית עם סלנג עדין, בלי אימוג׳ים ובלי סימנים מוקראים.",
@@ -208,6 +214,114 @@ function buildOpeningFromSSOT(ssot) {
   if (!tpl) return { text: fallback, bucket: g.bucket };
 
   return { text: tpl.replace("{GREETING}", g.text), bucket: g.bucket };
+}
+
+// ===== Intent + Name helpers =====
+function normalizeForMatch(s) {
+  return (s || "")
+    .toString()
+    .replace(/[.,!?;:"'(){}\[\]<>]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function splitTriggers(triggers) {
+  // supports: comma, newline, | separators
+  const raw = (triggers || "").toString();
+  return raw
+    .split(/\r?\n|,|\|/g)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function detectIntentFromSSOT(ssot, transcript) {
+  const t = normalizeForMatch(transcript);
+  if (!t) return { intent: "other", matched: null };
+
+  const intents = (ssot?.ok ? ssot.intents : []) || [];
+  if (!intents.length) return { intent: "other", matched: null };
+
+  // sort by priority desc
+  const sorted = intents.slice().sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+  for (const row of sorted) {
+    const type = (row.trigger_type || "contains").toLowerCase();
+    const trigList = splitTriggers(row.triggers_he);
+
+    for (const trig of trigList) {
+      const trigN = normalizeForMatch(trig);
+      if (!trigN) continue;
+
+      if (type === "regex") {
+        try {
+          const re = new RegExp(trig, "i");
+          if (re.test(transcript)) return { intent: row.intent, matched: trig };
+        } catch {
+          // ignore invalid regex
+        }
+      } else if (type === "starts_with") {
+        if (t.startsWith(trigN)) return { intent: row.intent, matched: trig };
+      } else {
+        // contains (default)
+        if (t.includes(trigN)) return { intent: row.intent, matched: trig };
+      }
+    }
+  }
+
+  return { intent: "other", matched: null };
+}
+
+function looksLikeNameToken(tok) {
+  if (!tok) return false;
+  if (/\d/.test(tok)) return false;
+  // Allow Hebrew/English letters, avoid long phrases
+  if (!/^[A-Za-z\u0590-\u05FF]{2,20}$/.test(tok)) return false;
+  const bad = ["אני", "שמי", "קוראים", "לי", "זה", "היי", "שלום", "כן", "לא", "בטי", "מרגריטה"];
+  if (bad.includes(tok)) return false;
+  return true;
+}
+
+function extractNameSoft(transcript) {
+  const raw = (transcript || "").toString().trim();
+  if (!raw) return null;
+
+  // Patterns:
+  // "קוראים לי X", "שמי X", "אני X"
+  const patterns = [
+    /קוראים\s+לי\s+([A-Za-z\u0590-\u05FF]{2,20})/i,
+    /שמי\s+([A-Za-z\u0590-\u05FF]{2,20})/i,
+    /אני\s+([A-Za-z\u0590-\u05FF]{2,20})/i,
+  ];
+  for (const re of patterns) {
+    const m = raw.match(re);
+    if (m && m[1] && looksLikeNameToken(m[1])) return m[1];
+  }
+
+  // Single/first token fallback
+  const toks = raw
+    .replace(/[^\w\u0590-\u05FF\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+
+  if (toks.length === 1 && looksLikeNameToken(toks[0])) return toks[0];
+
+  // First reasonable token
+  for (const tok of toks.slice(0, 4)) {
+    if (looksLikeNameToken(tok)) return tok;
+  }
+
+  return null;
+}
+
+function detectEnglishPreference(transcript) {
+  const s = (transcript || "").toString();
+  if (/[A-Za-z]/.test(s)) return true;
+  const t = s.toLowerCase();
+  if (t.includes("english") || t.includes("speak english") || t.includes("in english")) return true;
+  return false;
 }
 
 // ===== Preload SSOT on boot + periodic refresh =====
@@ -254,14 +368,31 @@ wss.on("connection", (twilioWs) => {
   let callSid = null;
 
   // OpenAI session readiness gates
-  let openaiReady = false; // WS open
-  let sessionConfigured = false; // after we send session.update
-  let pendingCreate = false; // if we got speech_stopped before ready
-  let responseInFlight = false; // prevent duplicate response.create
-  let openingLock = true; // block speech_stopped-triggered creates until opening finished
+  let openaiReady = false;
+  let sessionConfigured = false;
+
+  // Turn-taking
+  let pendingCreate = false;
+  let responseInFlight = false;
+  let openingLock = true;
   let lastResponseCreateAt = 0;
   let userFramesSinceLastCreate = 0;
-  let lastUserAudioAt = 0;
+
+  // Conversation state (in-memory for this call)
+  const state = {
+    name: null,
+    nameAskedCount: 0,
+    intent: "other",
+    intentMatched: null,
+    asked_for_margarita: false,
+    callback_requested: false,
+    contact_info_requested: false,
+    reports_details: "",
+    message: "",
+    user_prefers_english: false,
+    greeting_time_bucket: getGreetingBucketAndText().bucket,
+    last_user_transcript: "",
+  };
 
   // Queue Twilio audio until OpenAI WS is ready
   const audioQueue = [];
@@ -270,6 +401,9 @@ wss.on("connection", (twilioWs) => {
   // Outbound audio buffer until streamSid known
   const outAudioQueue = [];
   const MAX_OUT_QUEUE_FRAMES = 400;
+
+  // Assistant text accumulation for logs
+  let assistantTextBuf = "";
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -288,7 +422,6 @@ wss.on("connection", (twilioWs) => {
     while (audioQueue.length) {
       const payload = audioQueue.shift();
       userFramesSinceLastCreate += 1;
-      lastUserAudioAt = Date.now();
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
     }
   }
@@ -312,12 +445,49 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
+  function buildTurnInstructions(ssot) {
+    // Use SSOT prompts as base system policy (already in session.instructions),
+    // and inject state as "local" constraints for THIS response.
+    const lang = state.user_prefers_english ? "en" : "he";
+    const nameKnown = !!state.name;
+
+    // Minimal deterministic business logic for this stage
+    const leadGate = nameKnown
+      ? (lang === "he"
+          ? `השם של המתקשר כבר ידוע: "${state.name}". אל תשאלי שוב על השם.`
+          : `Caller name is known: "${state.name}". Do NOT ask again for the name.`)
+      : (lang === "he"
+          ? `חובה לאסוף שם (שם פרטי מספיק). אם אין שם עדיין, בקשי שם בצורה קצרה וברורה.`
+          : `You must collect the caller's name (first name is enough). If missing, ask for the name briefly.`);
+
+    const intentLine =
+      lang === "he"
+        ? `הכוונה הנוכחית: ${state.intent} (matched: ${state.intentMatched || "none"}).`
+        : `Current intent: ${state.intent} (matched: ${state.intentMatched || "none"}).`;
+
+    const styleLine =
+      lang === "he"
+        ? `סגנון: קצר, אנושי, אנרגטי, שאלה אחת בלבד בסוף. בלי אימוג'ים.`
+        : `Style: short, human, upbeat. Exactly one question at the end. No emojis.`;
+
+    const taskLine =
+      lang === "he"
+        ? `מטרה: להבין מה הלקוח צריך, ואם צריך—לקחת הודעה למרגריטה.`
+        : `Goal: understand what the caller needs and, if needed, take a message for Margarita.`;
+
+    // Avoid hallucinating office info: already in GUARDRAILS/KB, keep reminder
+    const kbReminder =
+      lang === "he"
+        ? `מידע משרדי (שעות/כתובת/טלפון/מייל) מוסרים רק אם נשאלים במפורש ורק מ-SETTINGS.`
+        : `Office info (hours/address/phone/email) only if explicitly asked and only from SETTINGS.`;
+
+    return [leadGate, intentLine, taskLine, kbReminder, styleLine].join(" ");
+  }
+
   function maybeCreateResponse(openaiWs, reason) {
     const now = Date.now();
 
-    // Block turn creates while opening is still in progress
     if (openingLock) return;
-
     if (responseInFlight) return;
 
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
@@ -334,7 +504,19 @@ wss.on("connection", (twilioWs) => {
     lastResponseCreateAt = now;
     userFramesSinceLastCreate = 0;
 
-    safeSend(openaiWs, { type: "response.create" });
+    // Per-turn instructions for orchestration
+    const ssot = ssotCache;
+    const turnInstructions = buildTurnInstructions(ssot);
+
+    assistantTextBuf = "";
+    safeSend(openaiWs, {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions: turnInstructions,
+      },
+    });
+
     pendingCreate = false;
     responseInFlight = true;
     console.log("[TURN] response.create", reason || "speech_stopped");
@@ -354,9 +536,7 @@ wss.on("connection", (twilioWs) => {
     console.log("[OPENAI] ws open");
     openaiReady = true;
 
-    // Use already-preloaded SSOT cache (no await here)
     const ssot = ssotCache;
-
     const instructions = buildInstructionsFromSSOT(ssot);
 
     const session = {
@@ -374,6 +554,7 @@ wss.on("connection", (twilioWs) => {
       max_response_output_tokens: "inf",
     };
 
+    // Enable STT (needed for transcript logs + intent/name)
     if (MB_TRANSCRIPTION_MODEL) {
       session.input_audio_transcription = {
         model: MB_TRANSCRIPTION_MODEL,
@@ -384,19 +565,16 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // Build exact opening text (from SSOT OPENING_SCRIPT; fallback otherwise)
+    // Opening (exact, no paraphrase)
     const openingObj = buildOpeningFromSSOT(ssot);
     const openingText = openingObj.text;
 
-    // IMPORTANT:
-    // We do NOT ask the model to "answer however". We force an exact utterance.
-    // Also we lock turn-taking until this initial utterance completes.
     openingLock = true;
     responseInFlight = true;
     lastResponseCreateAt = Date.now();
     userFramesSinceLastCreate = 0;
 
-    // Provide a tiny "user" message context so the model speaks the opening as its first turn.
+    // Context item (light)
     safeSend(openaiWs, {
       type: "conversation.item.create",
       item: {
@@ -410,13 +588,12 @@ wss.on("connection", (twilioWs) => {
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
-        // Force exact text; prohibit paraphrase
-        instructions:
-          `אמרי מילה במילה בדיוק את המשפט הבא, בלי להוסיף ובלי לשנות אף מילה: ${openingText}`,
+        instructions: `אמרי מילה במילה בדיוק את המשפט הבא, בלי להוסיף ובלי לשנות אף מילה: ${openingText}`,
       },
     });
 
     flushAudioQueue(openaiWs);
+    if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
 
   openaiWs.on("message", (raw) => {
@@ -427,14 +604,15 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
+    // Turn boundary
     if (msg.type === "input_audio_buffer.speech_stopped") {
       maybeCreateResponse(openaiWs, "speech_stopped");
       return;
     }
 
-    // Transcription logs (best-effort; event types may vary by model)
-    if (typeof msg.type === "string" && msg.type.includes("transcription")) {
-      // Try to extract any text field we can find
+    // Handle STT events (best-effort across event variants)
+    // We extract text from common shapes and update state.last_user_transcript.
+    if (MB_LOG_TRANSCRIPTS && typeof msg.type === "string" && msg.type.includes("transcription")) {
       const text =
         msg.transcript ||
         msg.text ||
@@ -442,33 +620,76 @@ wss.on("connection", (twilioWs) => {
         msg?.item?.content?.[0]?.text ||
         msg?.delta ||
         null;
-      if (text) console.log("[STT]", msg.type, String(text).slice(0, 500));
-      else console.log("[STT]", msg.type);
+
+      if (text && typeof text === "string") {
+        // Keep only meaningful, non-empty
+        const cleaned = text.trim();
+        if (cleaned) {
+          state.last_user_transcript = cleaned;
+          state.user_prefers_english = state.user_prefers_english || detectEnglishPreference(cleaned);
+
+          // Update name (Lead Gate)
+          if (!state.name) {
+            const maybeName = extractNameSoft(cleaned);
+            if (maybeName) {
+              state.name = maybeName;
+              console.log("[LEAD] name captured:", state.name);
+            }
+          }
+
+          // Update intent
+          const det = detectIntentFromSSOT(ssotCache, cleaned);
+          state.intent = det.intent || "other";
+          state.intentMatched = det.matched || null;
+
+          // Minimal flags
+          if (state.intent === "reach_margarita") state.asked_for_margarita = true;
+          if (state.intent === "callback_request") state.callback_requested = true;
+          if (state.intent === "ask_contact_info") state.contact_info_requested = true;
+          if (state.intent === "reports_request") state.reports_details = cleaned;
+
+          // message capture (for now keep last meaningful user statement)
+          state.message = cleaned;
+
+          console.log("[STT][USER]", cleaned);
+        }
+      }
+    }
+
+    // Assistant text accumulation (best-effort)
+    if (MB_LOG_ASSISTANT_TEXT && typeof msg.type === "string" && msg.type.includes("text") && msg.delta) {
+      if (typeof msg.delta === "string") assistantTextBuf += msg.delta;
+    }
+    if (MB_LOG_ASSISTANT_TEXT && typeof msg.type === "string" && msg.type.endsWith(".delta") && msg.text) {
+      if (typeof msg.text === "string") assistantTextBuf += msg.text;
     }
 
     // OpenAI error
     if (msg.type === "error") {
       console.error("[OPENAI] error event", msg);
-      // Allow recovery
       responseInFlight = false;
       openingLock = false;
       return;
     }
 
-    // When model finished speaking, allow the next user turn
+    // Response done => unlock
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
 
-      // If the completed response was the opening, unlock turn-taking.
       if (openingLock) {
         openingLock = false;
+        // After opening, if still no name, we will let next user turn trigger name gate.
       }
 
-      // If we had deferred a create and now unlocked, try it (rare)
+      if (MB_LOG_ASSISTANT_TEXT) {
+        const t = (assistantTextBuf || "").trim();
+        if (t) console.log("[LLM][ASSISTANT]", t.slice(0, 800));
+        assistantTextBuf = "";
+      }
+
       if (pendingCreate) {
         pendingCreate = false;
-        // Do not immediately create unless enough audio accumulated; maybeCreateResponse handles it.
-        maybeCreateResponse(openaiWs, "pending_after_opening");
+        maybeCreateResponse(openaiWs, "pending_after_completed");
       }
       return;
     }
@@ -569,7 +790,6 @@ wss.on("connection", (twilioWs) => {
 
       // Count audio frames for gating
       userFramesSinceLastCreate += 1;
-      lastUserAudioAt = Date.now();
 
       safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
       return;
