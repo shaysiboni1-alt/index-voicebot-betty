@@ -1,19 +1,20 @@
 // server.js
 // Index Betty – Realtime VoiceBot (OpenAI baseline + SSOT)
 // Baseline preserved (audio queue, VAD, debounce gates).
-// Adds:
-// A) STT transcript logs (from Realtime events) controlled by ENV
-// B) Assistant text logs controlled by ENV (includes audio_transcript)
-// C) POST /admin/reload-sheets (force SSOT reload) for Apps Script
-// D) SSOT prewarm + cache-first on call open (NO BLOCKING on open path)
-// E) MEMORY_DB via memoryDb.js (auto-migration + safe prewarm + runtime lookup/upsert/name-save)
-// F) BARGE-IN (response.cancel) with noise-resistant gating (MIN_MS + COOLDOWN) + AUDIO DROP window
-// G) Name Gate helper (reject obvious non-names / noise)
-// H) Closing enforcement in code when caller says bye/thanks/end (never opens new topics after closing)
-// I) LEAD GATE (deterministic) + Webhooks:
-//    - ABANDONED_WEBHOOK_URL -> CALL_LOG (per your mapping)
-//    - CALL_LOG_WEBHOOK_URL -> ABANDONED (per your mapping)
-//    - FINAL_WEBHOOK_URL -> FINAL + PARTIAL + INFO (INFO may be without name)
+// Adds / locks:
+// 1) Webhook ENV mapping (fixed):
+//    - CALL_LOG_WEBHOOK_URL   -> CALL_LOG
+//    - ABANDONED_WEBHOOK_URL  -> ABANDONED
+//    - FINAL_WEBHOOK_URL      -> FINAL + PARTIAL + INFO
+// 2) Lead decision (single decision point): FINAL / PARTIAL / INFO / ABANDONED
+//    - FINAL: name + message (+ callback_to_number if callback_requested)
+//    - PARTIAL: has name but missing message OR callback requested missing number
+//    - INFO: office info requested & answered (may be with/without name)
+//    - ABANDONED: not FINAL/PARTIAL/INFO and no name
+// 3) INFO payload enrichment: info_request_text, info_answer_text, info_topics, notes_internal
+// 4) Twilio recording public link for FINAL/PARTIAL/INFO/ABANDONED via proxy endpoint:
+//    - GET /recordings/:recordingSid.mp3  (streams from Twilio with Basic Auth)
+// 5) Noise solution option: MB_HALF_DUPLEX=true (strict turn-taking: drop user audio while bot speaking)
 
 const express = require("express");
 const http = require("http");
@@ -41,22 +42,29 @@ const MB_BARGEIN_MIN_MS = Number(process.env.MB_BARGEIN_MIN_MS || 250);
 const MB_BARGEIN_COOLDOWN_MS = Number(process.env.MB_BARGEIN_COOLDOWN_MS || 600);
 const MB_BARGEIN_AUDIO_DROP_MS = Number(process.env.MB_BARGEIN_AUDIO_DROP_MS || 0);
 
+// Strict turn-taking mode (noise hardening): when true, we drop user audio while assistant is speaking
+const MB_HALF_DUPLEX = String(process.env.MB_HALF_DUPLEX || "").toLowerCase() === "true";
+
 const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
 const GOOGLE_SA_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
 
 const MB_DEBUG = String(process.env.MB_DEBUG || "").toLowerCase() === "true";
-const MB_LOG_TRANSCRIPTS =
-  String(process.env.MB_LOG_TRANSCRIPTS || "").toLowerCase() === "true";
+const MB_LOG_TRANSCRIPTS = String(process.env.MB_LOG_TRANSCRIPTS || "").toLowerCase() === "true";
 const MB_LOG_ASSISTANT_TEXT =
   String(process.env.MB_LOG_ASSISTANT_TEXT || "").toLowerCase() === "true";
 
 const MB_FINAL_WEBHOOK_ONLY =
   String(process.env.MB_FINAL_WEBHOOK_ONLY || "").toLowerCase() === "true";
 
-// Webhook URLs (use EXACT names you requested)
-const ABANDONED_WEBHOOK_URL = (process.env.ABANDONED_WEBHOOK_URL || "").trim(); // per your mapping: CALL_LOG
-const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // per your mapping: ABANDONED
+// Webhook URLs (fixed mapping)
+const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // CALL_LOG
+const ABANDONED_WEBHOOK_URL = (process.env.ABANDONED_WEBHOOK_URL || "").trim(); // ABANDONED
 const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL + INFO
+
+// Twilio for recording fetch
+const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || "").trim();
+const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || "").trim();
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || "").trim();
 
 // DB URL (Render: DATABASE_URL)
 const MEMORY_DB_URL = (process.env.MEMORY_DB_URL || process.env.DATABASE_URL || "").trim();
@@ -68,6 +76,14 @@ if (!OPENAI_API_KEY) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function baseUrlNoSlash(u) {
+  return String(u || "").replace(/\/+$/, "");
 }
 
 function getGreetingBucketAndText() {
@@ -240,8 +256,34 @@ function getSSOTCacheFast() {
 
 /* ================== Name heuristics ================== */
 const NAME_REJECT_WORDS = new Set([
-  "היי","שלום","כן","לא","רגע","שנייה","שניה","אוקיי","אוקי","המ","אמ","אה","טוב","ביי","להתראות","תודה",
-  "מה","למה","איפה","מתי","איך","כמה","מי","בסדר","תשמע","תקשיבי","תקשיבו","בסדר גמור"
+  "היי",
+  "שלום",
+  "כן",
+  "לא",
+  "רגע",
+  "שנייה",
+  "שניה",
+  "אוקיי",
+  "אוקי",
+  "המ",
+  "אמ",
+  "אה",
+  "טוב",
+  "ביי",
+  "להתראות",
+  "תודה",
+  "מה",
+  "למה",
+  "איפה",
+  "מתי",
+  "איך",
+  "כמה",
+  "מי",
+  "בסדר",
+  "תשמע",
+  "תקשיבי",
+  "תקשיבו",
+  "בסדר גמור",
 ]);
 
 function looksLikeName(text) {
@@ -291,14 +333,30 @@ function extractILPhoneDigits(text) {
 function isCallbackRequested(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  return /(תחזרו|תחזור|חזרה|שיחזרו|טלפון חוזר|תתקשרו|שיחה חוזרת|שיחזר אליי|לחזור אלי|לחזור אליי)/.test(t);
+  return /(תחזרו|תחזור|חזרה|שיחזרו|טלפון חוזר|תתקשרו|שיחה חוזרת|שיחזר אליי|לחזור אלי|לחזור אליי)/.test(
+    t
+  );
 }
 
-/* ================== INFO detection helpers (minimal) ================== */
+/* ================== INFO detection (deterministic) ================== */
 function isInfoRequest(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  return /(שעות|שעות פעילות|עד מתי|מתי פתוח|מתי פתוחים|כתובת|איפה אתם|מיקום|טלפון|מספר טלפון|איך מתקשרים|מייל|אימייל|דוא"ל|email)/i.test(t);
+  return /(שעות|שעות פעילות|עד מתי|מתי פתוח|מתי פתוחים|כתובת|איפה אתם|מיקום|טלפון|מספר טלפון|איך מתקשרים|מייל|אימייל|דוא"ל|email)/i.test(
+    t
+  );
+}
+
+function detectInfoTopics(text) {
+  const t = String(text || "").toLowerCase();
+  const topics = [];
+
+  if (/(שעות|שעות פעילות|פתוח|פתוחים|סגור|סגורים)/.test(t)) topics.push("WORKING_HOURS");
+  if (/(כתובת|איפה אתם|מיקום)/.test(t)) topics.push("BUSINESS_ADDRESS");
+  if (/(טלפון|מספר טלפון|איך מתקשרים|מספר)/.test(t)) topics.push("MAIN_PHONE");
+  if (/(מייל|אימייל|דוא"ל|email)/.test(t)) topics.push("BUSINESS_EMAIL");
+
+  return Array.from(new Set(topics));
 }
 
 /* ================== Webhook sender + https logs ================== */
@@ -338,9 +396,73 @@ async function postJson(url, payload, meta = {}) {
   }
 }
 
+/* ================== Twilio recording helpers ================== */
+function twilioAuthHeader() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return null;
+  const token = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  return `Basic ${token}`;
+}
+
+async function fetchLatestRecordingSid(callSid) {
+  if (!callSid) return null;
+  const auth = twilioAuthHeader();
+  if (!auth) return null;
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+    TWILIO_ACCOUNT_SID
+  )}/Calls/${encodeURIComponent(callSid)}/Recordings.json?PageSize=50`;
+
+  try {
+    const res = await fetch(url, { headers: { Authorization: auth } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const recs = Array.isArray(json.recordings) ? json.recordings : [];
+    if (!recs.length) return null;
+
+    // pick newest by date_created if available
+    recs.sort((a, b) => {
+      const da = Date.parse(a.date_created || "") || 0;
+      const db = Date.parse(b.date_created || "") || 0;
+      return db - da;
+    });
+
+    const sid = recs[0]?.sid || null;
+    return sid;
+  } catch {
+    return null;
+  }
+}
+
 /* ================== APP ================== */
 const app = express();
 app.use(express.json());
+
+// Public proxy for Twilio recordings (keeps Twilio creds private)
+app.get("/recordings/:recordingSid.mp3", async (req, res) => {
+  const recordingSid = String(req.params.recordingSid || "").trim();
+  const auth = twilioAuthHeader();
+
+  if (!recordingSid) return res.status(400).send("missing recordingSid");
+  if (!auth) return res.status(500).send("recording proxy not configured");
+
+  const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+    TWILIO_ACCOUNT_SID
+  )}/Recordings/${encodeURIComponent(recordingSid)}.mp3`;
+
+  try {
+    const r = await fetch(mediaUrl, { headers: { Authorization: auth } });
+    if (!r.ok) return res.status(404).send("recording not found");
+
+    res.setHeader("content-type", "audio/mpeg");
+    res.setHeader("cache-control", "public, max-age=31536000, immutable");
+
+    // Stream
+    const buf = Buffer.from(await r.arrayBuffer());
+    return res.status(200).send(buf);
+  } catch (e) {
+    return res.status(502).send("recording fetch failed");
+  }
+});
 
 app.get("/health", async (req, res) => {
   await loadSSOT(false);
@@ -367,6 +489,11 @@ app.get("/health", async (req, res) => {
       last_ok_at: memory.state.last_ok_at,
     },
     model: OPENAI_REALTIME_MODEL,
+    recordings_proxy: {
+      enabled: !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && PUBLIC_BASE_URL),
+      public_base_url: baseUrlNoSlash(PUBLIC_BASE_URL) || null,
+    },
+    half_duplex: MB_HALF_DUPLEX,
   });
 });
 
@@ -425,6 +552,9 @@ wss.on("connection", (twilioWs) => {
   let lastResponseCreateAt = 0;
   let userFramesSinceLastCreate = 0;
 
+  // Assistant speaking (for half-duplex)
+  let assistantSpeaking = false;
+
   // BARGE-IN state + audio drop window
   let speechActive = false;
   let lastBargeinAt = 0;
@@ -455,9 +585,19 @@ wss.on("connection", (twilioWs) => {
   let callbackToNumber = null; // digits or e164
   let closingForced = false;
 
-  // INFO tracking (new)
-  let infoRequested = false;     // user asked office info
-  let infoProvided = false;      // assistant started answering that info
+  // INFO tracking (locked)
+  let infoRequested = false; // user asked office info
+  let infoProvided = false; // assistant answered office info (meaningfully)
+  let infoRequestText = null;
+  let infoTopics = [];
+  let infoAnswerCaptureActive = false;
+  let infoAnswerText = "";
+  let infoAnswerCharsMax = 1200;
+
+  // Recording tracking
+  let recordingSid = null;
+  let recordingPublicUrl = null;
+  let recordingResolved = false;
 
   // Lead/webhook bookkeeping
   const callStartedAtIso = nowIso();
@@ -518,6 +658,7 @@ wss.on("connection", (twilioWs) => {
         },
       });
       responseInFlight = true;
+      assistantSpeaking = true;
       if (MB_DEBUG) console.log("[CLOSING] forced");
       return;
     }
@@ -525,6 +666,7 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
     responseInFlight = true;
+    assistantSpeaking = true;
     if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
   }
 
@@ -542,6 +684,9 @@ wss.on("connection", (twilioWs) => {
 
   function onSpeechStarted(openaiWs) {
     speechActive = true;
+
+    // Half-duplex: never barge-in / cancel
+    if (MB_HALF_DUPLEX) return;
 
     if (!MB_BARGEIN_ENABLED) return;
     if (!responseInFlight) return;
@@ -606,6 +751,53 @@ wss.on("connection", (twilioWs) => {
     asstAudioTranscriptBuf = "";
   }
 
+  async function ensureRecordingResolved(reason) {
+    if (recordingResolved) return;
+    recordingResolved = true; // prevent concurrent storms
+
+    // We only REQUIRE recording in FINAL/PARTIAL/INFO/ABANDONED (not call log). Still resolve once here.
+    if (!callSid) return;
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !PUBLIC_BASE_URL) return;
+
+    // Twilio recording may appear with a small delay after hangup. Retry a few times.
+    const attempts = 3;
+    const delays = [350, 700, 1200];
+
+    for (let i = 0; i < attempts; i++) {
+      const sid = await fetchLatestRecordingSid(callSid);
+      if (sid) {
+        recordingSid = sid;
+        recordingPublicUrl = `${baseUrlNoSlash(PUBLIC_BASE_URL)}/recordings/${sid}.mp3`;
+        if (MB_DEBUG) console.log("[RECORDING] resolved", { reason, recordingSid: sid });
+        return;
+      }
+      await sleep(delays[i] || 700);
+    }
+
+    if (MB_DEBUG) console.log("[RECORDING] not found after retries", { reason });
+  }
+
+  function buildNotesInternalForDecision(decision) {
+    const parts = [];
+    parts.push(`decision=${decision}`);
+
+    if (decision === "INFO") {
+      if (infoRequestText) parts.push(`info_asked="${String(infoRequestText).slice(0, 220)}"`);
+      if (infoTopics.length) parts.push(`info_topics=${infoTopics.join(",")}`);
+
+      const ans = String(infoAnswerText || "").trim();
+      if (ans) parts.push(`info_answer="${ans.slice(0, 420)}"`);
+      else parts.push("info_answer=empty");
+    }
+
+    // recording note (debug-friendly)
+    if (!recordingPublicUrl && (decision === "FINAL" || decision === "PARTIAL" || decision === "INFO" || decision === "ABANDONED")) {
+      parts.push("recording_public_url=missing");
+    }
+
+    return parts.join(" | ");
+  }
+
   function buildBasePayload() {
     const ended = callEndedAtIso || nowIso();
     const started = callStartedAtIso;
@@ -634,9 +826,17 @@ wss.on("connection", (twilioWs) => {
       message: capturedMessage || null,
       callback_requested: !!callbackRequested,
       callback_to_number: callbackToNumber || null,
+
+      // INFO enrichment
+      info_request_text: infoRequestText || null,
+      info_answer_text: String(infoAnswerText || "").trim() || null,
+      info_topics: Array.isArray(infoTopics) && infoTopics.length ? infoTopics : null,
+
+      // internal note
       notes_internal: null,
+
       recording_provider: "twilio",
-      recording_public_url: null,
+      recording_public_url: recordingPublicUrl || null,
     };
   }
 
@@ -656,19 +856,19 @@ wss.on("connection", (twilioWs) => {
   }
 
   function isInfoCall() {
-    // INFO = אין name, אבל נמסר מידע ענייני/משרדי (שעות/כתובת/טלפון/מייל)
-    return !capturedName && !!infoProvided;
+    // INFO = office info requested and answered (may be with/without name)
+    return !!infoProvided;
   }
 
   async function sendCallLogOnce() {
-    // Per your mapping: ABANDONED_WEBHOOK_URL == CALL_LOG
     if (sentCallLog) return;
-    if (!ABANDONED_WEBHOOK_URL) return;
+    if (!CALL_LOG_WEBHOOK_URL) return;
     if (MB_FINAL_WEBHOOK_ONLY) return;
 
     sentCallLog = true;
     const payload = { event_type: "CALL_LOG", lead_type: "CALL_LOG", ...buildBasePayload() };
-    await postJson(ABANDONED_WEBHOOK_URL, payload, { tag: "CALL_LOG" });
+    // notes_internal for call log is optional; keep null to avoid noise
+    await postJson(CALL_LOG_WEBHOOK_URL, payload, { tag: "CALL_LOG" });
   }
 
   async function sendFinalOnce() {
@@ -677,6 +877,7 @@ wss.on("connection", (twilioWs) => {
     sentFinal = true;
 
     const payload = { event_type: "FINAL", lead_type: "FINAL", ...buildBasePayload() };
+    payload.notes_internal = buildNotesInternalForDecision("FINAL");
     await postJson(FINAL_WEBHOOK_URL, payload, { tag: "FINAL" });
   }
 
@@ -686,6 +887,7 @@ wss.on("connection", (twilioWs) => {
     sentPartial = true;
 
     const payload = { event_type: "PARTIAL", lead_type: "PARTIAL", ...buildBasePayload() };
+    payload.notes_internal = buildNotesInternalForDecision("PARTIAL");
     await postJson(FINAL_WEBHOOK_URL, payload, { tag: "PARTIAL" });
   }
 
@@ -695,22 +897,26 @@ wss.on("connection", (twilioWs) => {
     sentInfo = true;
 
     const payload = { event_type: "INFO", lead_type: "INFO", ...buildBasePayload() };
+    payload.notes_internal = buildNotesInternalForDecision("INFO");
     await postJson(FINAL_WEBHOOK_URL, payload, { tag: "INFO" });
   }
 
   async function sendAbandonedOnce() {
-    // Per your mapping: CALL_LOG_WEBHOOK_URL == ABANDONED
     if (sentAbandoned) return;
-    if (!CALL_LOG_WEBHOOK_URL) return;
+    if (!ABANDONED_WEBHOOK_URL) return;
     sentAbandoned = true;
 
     const payload = { event_type: "ABANDONED", lead_type: "ABANDONED", ...buildBasePayload() };
-    await postJson(CALL_LOG_WEBHOOK_URL, payload, { tag: "ABANDONED" });
+    payload.notes_internal = buildNotesInternalForDecision("ABANDONED");
+    await postJson(ABANDONED_WEBHOOK_URL, payload, { tag: "ABANDONED" });
   }
 
   async function decideAndSendOnEnd(reason) {
     // Single decision point (prevents contradictions)
     if (sentFinal || sentPartial || sentInfo || sentAbandoned) return;
+
+    // Resolve recording before final/partial/info/abandoned (best effort with retries)
+    await ensureRecordingResolved(reason);
 
     let decision = "NONE";
 
@@ -727,7 +933,7 @@ wss.on("connection", (twilioWs) => {
       decision = "ABANDONED";
       await sendAbandonedOnce();
     } else {
-      // fallback safety (should not happen): if name exists but nothing else, it's PARTIAL
+      // fallback safety: name exists but nothing else -> PARTIAL
       decision = "PARTIAL_FALLBACK";
       await sendPartialOnce();
     }
@@ -742,6 +948,7 @@ wss.on("connection", (twilioWs) => {
         callback_to_number: !!callbackToNumber,
         infoRequested,
         infoProvided,
+        recording_public_url: recordingPublicUrl || null,
       });
     }
   }
@@ -763,10 +970,12 @@ wss.on("connection", (twilioWs) => {
 
     if (isCallerWantsToEnd(text)) closingForced = true;
 
-    // INFO request detection (new)
+    // INFO request detection (locked)
     if (!infoRequested && isInfoRequest(text)) {
       infoRequested = true;
-      if (MB_DEBUG) console.log("[INFO] requested=true (from user)");
+      infoRequestText = text;
+      infoTopics = detectInfoTopics(text);
+      if (MB_DEBUG) console.log("[INFO] requested=true (from user)", { infoTopics });
     }
 
     if (!callbackRequested && isCallbackRequested(text)) {
@@ -779,7 +988,7 @@ wss.on("connection", (twilioWs) => {
         capturedName = text;
         expectingName = false;
         if (MB_DEBUG) console.log("[NAME] captured", { name: capturedName });
-        if (callerE164) memory.saveName(callerE164, capturedName).catch(() => {});
+        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
       } else {
         if (MB_DEBUG) console.log("[NAME] rejected", { utterance: text });
       }
@@ -929,7 +1138,7 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // CALL_LOG (per your mapping it goes to ABANDONED_WEBHOOK_URL)
+    // CALL_LOG
     sendCallLogOnce().catch(() => {});
 
     // Opening: speak immediately (no extra pre-say)
@@ -951,6 +1160,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     responseInFlight = true;
+    assistantSpeaking = true;
     flushAudioQueue(openaiWs);
     if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
@@ -991,7 +1201,26 @@ wss.on("connection", (twilioWs) => {
       }
     }
 
-    // Assistant text logs
+    // BARGE-IN hooks
+    if (msg.type === "input_audio_buffer.speech_started") {
+      onSpeechStarted(openaiWs);
+      return;
+    }
+    if (msg.type === "input_audio_buffer.speech_stopped") {
+      onSpeechStopped();
+
+      if (lastUserUtterance) applyDeterministicGatesFromUserUtterance(lastUserUtterance);
+
+      if (closingForced) {
+        callEndedAtIso = nowIso();
+        decideAndSendOnEnd("closing_forced").catch(() => {});
+      }
+
+      maybeCreateResponse(openaiWs, "speech_stopped");
+      return;
+    }
+
+    // Assistant text logs + deterministic gate detection + INFO capture
     if (MB_LOG_ASSISTANT_TEXT) {
       if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
         logAsstDelta(msg.delta);
@@ -1008,11 +1237,17 @@ wss.on("connection", (twilioWs) => {
 
         const d = msg.delta;
 
-        // If user requested info, and assistant started responding -> INFO provided
+        // INFO answer capture: first assistant answer after infoRequested
         if (infoRequested && !infoProvided) {
-          // mark as soon as assistant begins responding (minimal + safe)
+          // Start capturing the assistant answer for INFO (only first answer block)
           infoProvided = true;
+          infoAnswerCaptureActive = true;
           if (MB_DEBUG) console.log("[INFO] provided=true (assistant started answering)");
+        }
+        if (infoAnswerCaptureActive) {
+          if (infoAnswerText.length < infoAnswerCharsMax) {
+            infoAnswerText += d;
+          }
         }
 
         // deterministically detect prompts from assistant to set gates
@@ -1041,43 +1276,62 @@ wss.on("connection", (twilioWs) => {
           }
         }
       }
+
       if (msg.type === "response.audio_transcript.done") {
         flushAsstAudioTranscriptLine();
+        // Stop INFO capture after the first assistant answer block ends
+        if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
       }
 
       if (msg.type === "response.completed") {
         flushAsstLine();
         flushAsstAudioTranscriptLine();
+        if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
       }
-    }
+    } else {
+      // Even if logs disabled, we still need deterministic INFO capture from audio_transcript
+      if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
+        const d = msg.delta;
 
-    // BARGE-IN hooks
-    if (msg.type === "input_audio_buffer.speech_started") {
-      onSpeechStarted(openaiWs);
-      return;
-    }
+        if (infoRequested && !infoProvided) {
+          infoProvided = true;
+          infoAnswerCaptureActive = true;
+          if (MB_DEBUG) console.log("[INFO] provided=true (assistant started answering)");
+        }
+        if (infoAnswerCaptureActive) {
+          if (infoAnswerText.length < infoAnswerCharsMax) infoAnswerText += d;
+        }
 
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      onSpeechStopped();
-
-      if (lastUserUtterance) applyDeterministicGatesFromUserUtterance(lastUserUtterance);
-
-      if (closingForced) {
-        callEndedAtIso = nowIso();
-        decideAndSendOnEnd("closing_forced").catch(() => {});
+        // deterministic gate detection still needed
+        if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
+          if (!capturedName) expectingName = true;
+        }
+        if (/מה הנושא|מה תרצה שאעביר|מה תרצו שאעביר|מה למסור/.test(d)) {
+          expectingMessage = true;
+        }
+        if (/נוח לחזור למספר שממנו התקשר/.test(d)) {
+          callbackRequested = true;
+          expectingCallbackConfirm = true;
+        }
+        if (/מה המספר|מספר טלפון|מספר לחזרה/.test(d)) {
+          if (callbackRequested && !callbackToNumber) expectingCallbackNumber = true;
+        }
       }
-
-      maybeCreateResponse(openaiWs, "speech_stopped");
-      return;
+      if (msg.type === "response.audio_transcript.done" || msg.type === "response.completed") {
+        if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
+      }
     }
 
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
+      assistantSpeaking = false;
       return;
     }
 
     // AUDIO OUT (DO NOT TOUCH) – but allow drop window after barge-in cancel
     if (msg.type === "response.audio.delta" && streamSid) {
+      assistantSpeaking = true;
+
       if (dropAudioUntilTs && Date.now() < dropAudioUntilTs) return;
 
       try {
@@ -1096,11 +1350,13 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("error", (e) => {
     responseInFlight = false;
+    assistantSpeaking = false;
     console.error("[OPENAI] ws error", e && (e.message || e));
   });
 
   openaiWs.on("close", (code, reason) => {
     responseInFlight = false;
+    assistantSpeaking = false;
     if (MB_DEBUG) console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
@@ -1139,6 +1395,11 @@ wss.on("connection", (twilioWs) => {
     if (msg.event === "media") {
       const payload = msg.media?.payload;
       if (!payload) return;
+
+      // Half-duplex: drop user audio while assistant is speaking
+      if (MB_HALF_DUPLEX && assistantSpeaking) {
+        return;
+      }
 
       if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
         audioQueue.push(payload);
