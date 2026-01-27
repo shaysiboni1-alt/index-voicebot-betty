@@ -6,23 +6,20 @@
 // B) Assistant text logs controlled by ENV (includes audio_transcript)
 // C) POST /admin/reload-sheets (force SSOT reload) for Apps Script
 // D) SSOT prewarm + cache-first on call open (NO BLOCKING on open path)
-// E) MEMORY_DB auto-migration + safe prewarm + runtime lookup/upsert/name-save
-// F) BARGE-IN (response.cancel) with noise-resistant gating (MIN_MS + COOLDOWN)
+// E) MEMORY_DB via memoryDb.js (auto-migration + safe prewarm + runtime lookup/upsert/name-save)
+// F) BARGE-IN (response.cancel) with noise-resistant gating (MIN_MS + COOLDOWN) + AUDIO DROP window
 // G) Name Gate helper (reject obvious non-names / noise)
 // H) Closing enforcement in code when caller says bye/thanks/end (never opens new topics after closing)
+// I) LEAD GATE (deterministic) + Webhooks:
+//    - ABANDONED_WEBHOOK_URL -> CALL_LOG (per your mapping)
+//    - CALL_LOG_WEBHOOK_URL -> ABANDONED (per your mapping)
+//    - FINAL_WEBHOOK_URL -> FINAL + PARTIAL
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
-
-// pg is optional. Only used when DB URL exists.
-let Pg;
-try {
-  Pg = require("pg");
-} catch {
-  Pg = null;
-}
+const { createMemoryDb } = require("./memoryDb");
 
 const PORT = process.env.PORT || 10000;
 
@@ -42,6 +39,7 @@ const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
 const MB_BARGEIN_ENABLED = String(process.env.MB_BARGEIN_ENABLED || "").toLowerCase() === "true";
 const MB_BARGEIN_MIN_MS = Number(process.env.MB_BARGEIN_MIN_MS || 250);
 const MB_BARGEIN_COOLDOWN_MS = Number(process.env.MB_BARGEIN_COOLDOWN_MS || 600);
+const MB_BARGEIN_AUDIO_DROP_MS = Number(process.env.MB_BARGEIN_AUDIO_DROP_MS || 0);
 
 const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
 const GOOGLE_SA_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
@@ -51,6 +49,14 @@ const MB_LOG_TRANSCRIPTS =
   String(process.env.MB_LOG_TRANSCRIPTS || "").toLowerCase() === "true";
 const MB_LOG_ASSISTANT_TEXT =
   String(process.env.MB_LOG_ASSISTANT_TEXT || "").toLowerCase() === "true";
+
+const MB_FINAL_WEBHOOK_ONLY =
+  String(process.env.MB_FINAL_WEBHOOK_ONLY || "").toLowerCase() === "true";
+
+// Webhook URLs (use EXACT names you requested)
+const ABANDONED_WEBHOOK_URL = (process.env.ABANDONED_WEBHOOK_URL || "").trim(); // per your mapping: CALL_LOG
+const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // per your mapping: ABANDONED
+const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL
 
 // DB URL (Render: DATABASE_URL)
 const MEMORY_DB_URL = (process.env.MEMORY_DB_URL || process.env.DATABASE_URL || "").trim();
@@ -90,180 +96,25 @@ function injectVars(text, vars) {
   return out;
 }
 
-function normalizeE164(s) {
-  const t = String(s || "").trim();
-  if (!t) return null;
-  // Twilio will usually send +972...
-  if (t.startsWith("+") && t.length >= 8) return t;
-  // Try to salvage digits
-  const digits = t.replace(/[^\d+]/g, "");
-  if (digits.startsWith("+") && digits.length >= 8) return digits;
-  return null;
+function buildSettingsContext(settings) {
+  const lines = Object.entries(settings || {}).map(([k, v]) => `${k}=${String(v ?? "")}`);
+  return lines.join("\n");
 }
 
-/* ================== MEMORY DB (safe) ================== */
-const memoryDb = {
-  enabled: false,
-  ready: false,
-  error: null,
-  pool: null,
-  last_ok_at: null,
-};
-
-function memoryDbEnabled() {
-  return !!(MEMORY_DB_URL && Pg);
-}
-
-async function initMemoryDbIfNeeded() {
-  memoryDb.enabled = memoryDbEnabled();
-
-  if (!memoryDb.enabled) {
-    memoryDb.ready = false;
-    if (MEMORY_DB_URL && !Pg) memoryDb.error = "pg module is not available (missing dependency).";
-    return memoryDb;
-  }
-
-  if (memoryDb.pool) return memoryDb;
-
-  try {
-    const { Pool } = Pg;
-    memoryDb.pool = new Pool({
-      connectionString: MEMORY_DB_URL,
-      ssl: MEMORY_DB_URL.includes("render.com") ? { rejectUnauthorized: false } : undefined,
-      max: 2,
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 10_000,
-    });
-
-    await memoryDb.pool.query("SELECT 1");
-
-    // IMPORTANT: We align on caller_id_e164 (TEXT) as canonical key.
-    // Create table if missing, then add any missing columns (handles older broken schemas).
-    await memoryDb.pool.query(`
-      CREATE TABLE IF NOT EXISTS caller_memory (
-        caller_id_e164 TEXT PRIMARY KEY,
-        name TEXT,
-        call_count INTEGER DEFAULT 0,
-        last_call_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-
-    const alters = [
-      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS caller_id_e164 TEXT;`,
-      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS name TEXT;`,
-      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS call_count INTEGER DEFAULT 0;`,
-      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS last_call_at TIMESTAMPTZ;`,
-      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`,
-      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`,
-    ];
-
-    for (const sql of alters) {
-      await memoryDb.pool.query(sql);
-    }
-
-    // If table existed without PK on caller_id_e164, we won't try to rewrite PK (dangerous).
-    // But we DO ensure the column exists and we use it for lookups going forward.
-
-    await memoryDb.pool.query(
-      `CREATE INDEX IF NOT EXISTS idx_caller_memory_last_call_at ON caller_memory (last_call_at);`
-    );
-
-    memoryDb.ready = true;
-    memoryDb.error = null;
-    memoryDb.last_ok_at = nowIso();
-
-    if (MB_DEBUG) console.log("[MEMORY_DB] ready");
-  } catch (e) {
-    memoryDb.ready = false;
-    memoryDb.error = e && (e.message || String(e));
-    console.error("[MEMORY_DB] init failed", memoryDb.error);
-  }
-
-  return memoryDb;
-}
-
-async function memoryLookup(callerE164) {
-  try {
-    if (!callerE164) return null;
-    await initMemoryDbIfNeeded();
-    if (!memoryDb.ready || !memoryDb.pool) return null;
-
-    const res = await memoryDb.pool.query(
-      `SELECT caller_id_e164, name, call_count, last_call_at FROM caller_memory WHERE caller_id_e164 = $1 LIMIT 1`,
-      [callerE164]
-    );
-    return res.rows?.[0] || null;
-  } catch (e) {
-    console.error("[MEMORY] lookup failed", e && (e.message || String(e)));
-    return null;
-  }
-}
-
-async function memoryUpsertCall(callerE164) {
-  try {
-    if (!callerE164) return;
-    await initMemoryDbIfNeeded();
-    if (!memoryDb.ready || !memoryDb.pool) return;
-
-    await memoryDb.pool.query(
-      `
-      INSERT INTO caller_memory (caller_id_e164, call_count, last_call_at, created_at, updated_at)
-      VALUES ($1, 1, NOW(), NOW(), NOW())
-      ON CONFLICT (caller_id_e164)
-      DO UPDATE SET
-        call_count = COALESCE(caller_memory.call_count, 0) + 1,
-        last_call_at = NOW(),
-        updated_at = NOW()
-      `,
-      [callerE164]
-    );
-
-    memoryDb.last_ok_at = nowIso();
-  } catch (e) {
-    console.error("[MEMORY] upsert_call failed", e && (e.message || String(e)));
-  }
-}
-
-async function memorySaveName(callerE164, name) {
-  try {
-    if (!callerE164) return;
-    const n = String(name || "").trim();
-    if (!n) return;
-
-    await initMemoryDbIfNeeded();
-    if (!memoryDb.ready || !memoryDb.pool) return;
-
-    await memoryDb.pool.query(
-      `
-      INSERT INTO caller_memory (caller_id_e164, name, call_count, last_call_at, created_at, updated_at)
-      VALUES ($1, $2, 1, NOW(), NOW(), NOW())
-      ON CONFLICT (caller_id_e164)
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        updated_at = NOW()
-      `,
-      [callerE164, n]
-    );
-
-    memoryDb.last_ok_at = nowIso();
-  } catch (e) {
-    console.error("[MEMORY] name_saved failed", e && (e.message || String(e)));
-  }
-}
+/* ================== Memory DB (module) ================== */
+const memory = createMemoryDb({ url: MEMORY_DB_URL, debug: MB_DEBUG });
 
 // Prewarm memory DB at startup (never blocks boot)
 (async () => {
   const t0 = Date.now();
   try {
-    await initMemoryDbIfNeeded();
+    await memory.init();
   } finally {
     if (MB_DEBUG) {
       console.log("[MEMORY_DB] prewarm", {
-        enabled: memoryDb.enabled,
-        ready: memoryDb.ready,
-        error: memoryDb.error,
+        enabled: memory.state.enabled,
+        ready: memory.state.ready,
+        error: memory.state.error,
         ms: Date.now() - t0,
       });
     }
@@ -277,12 +128,7 @@ const ssot = {
   enabled: !!(GSHEET_ID && GOOGLE_SA_B64),
   loaded_at: null,
   error: null,
-  data: {
-    settings: {},
-    prompts: {},
-    intents: [],
-    intent_suggestions: [],
-  },
+  data: { settings: {}, prompts: {}, intents: [], intent_suggestions: [] },
   _expires: 0,
 };
 
@@ -301,7 +147,6 @@ async function loadSSOT(force = false) {
       creds.private_key,
       ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     );
-
     const sheets = google.sheets({ version: "v4", auth });
 
     async function read(range) {
@@ -366,12 +211,11 @@ async function loadSSOT(force = false) {
 function getSSOTCacheFast() {
   const now = Date.now();
   const hasData =
-    Object.keys(ssot.data.settings || {}).length > 0 && Object.keys(ssot.data.prompts || {}).length > 0;
+    Object.keys(ssot.data.settings || {}).length > 0 &&
+    Object.keys(ssot.data.prompts || {}).length > 0;
 
   const stale = !ssot.loaded_at || now >= ssot._expires;
 
-  // If we have data, DO NOT block the call path: use cache immediately.
-  // If stale, refresh in background.
   if (hasData) {
     if (stale) {
       if (MB_DEBUG) console.log("[SSOT] stale cache -> background refresh");
@@ -379,7 +223,6 @@ function getSSOTCacheFast() {
     }
     return { ok: true, stale, ssot };
   }
-
   return { ok: false, stale: true, ssot };
 }
 
@@ -395,11 +238,6 @@ function getSSOTCacheFast() {
   }
 })();
 
-function buildSettingsContext(settings) {
-  const lines = Object.entries(settings || {}).map(([k, v]) => `${k}=${String(v ?? "")}`);
-  return lines.join("\n");
-}
-
 /* ================== Name heuristics ================== */
 const NAME_REJECT_WORDS = new Set([
   "היי","שלום","כן","לא","רגע","שנייה","שניה","אוקיי","אוקי","המ","אמ","אה","טוב","ביי","להתראות","תודה",
@@ -409,23 +247,21 @@ const NAME_REJECT_WORDS = new Set([
 function looksLikeName(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  const cleaned = t.replace(/[^\u0590-\u05FFa-zA-Z\s'-]/g, "").trim(); // allow heb/eng letters
+  const cleaned = t.replace(/[^\u0590-\u05FFa-zA-Z\s'-]/g, "").trim();
   if (!cleaned) return false;
+
   const words = cleaned.split(/\s+/).filter(Boolean);
   if (words.length > 3) return false;
   if (cleaned.length > 22) return false;
   if (/\d/.test(t)) return false;
 
-  const lower = cleaned.toLowerCase();
-  // reject if contains question words / fillers
   for (const w of words) {
     const ww = w.toLowerCase();
     if (NAME_REJECT_WORDS.has(ww)) return false;
   }
-  // if it's single very common preposition-like "בבית/במשחקים" etc -> reject
   if (words.length === 1) {
     const w = words[0];
-    if (w.startsWith("ב") && w.length >= 4) return false; // crude but effective against "בבית/במשחקים"
+    if (w.startsWith("ב") && w.length >= 4) return false;
   }
   return true;
 }
@@ -437,13 +273,50 @@ function isCallerWantsToEnd(stt) {
   return /(ביי|להתראות|סיימנו|זהו|תודה ביי|יאללה ביי|נדבר|סגרנו)/.test(t);
 }
 
+/* ================== Callback detection helpers ================== */
+function isYes(text) {
+  const t = String(text || "").trim();
+  return /^(כן|כן בבקשה|כן תודה|בטח|נכון|כן כן)$/i.test(t);
+}
+function isNo(text) {
+  const t = String(text || "").trim();
+  return /^(לא|לא תודה|ממש לא|לא לא)$/i.test(t);
+}
+function extractILPhoneDigits(text) {
+  const t = String(text || "");
+  const digits = t.replace(/[^\d]/g, "");
+  // Israel numbers usually 9-10 digits (including leading 0)
+  if (digits.length === 9 || digits.length === 10) return digits;
+  return null;
+}
+function isCallbackRequested(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return /(תחזרו|תחזור|חזרה|שיחזרו|טלפון חוזר|תתקשרו|שיחה חוזרת|שיחזר אליי|לחזור אלי|לחזור אליי)/.test(t);
+}
+
+/* ================== Webhook sender ================== */
+async function postJson(url, payload) {
+  if (!url) return;
+  try {
+    // fire-and-forget semantics; still await to keep ordering where we call it awaited
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.error("[WEBHOOK] post failed", url, e && (e.message || String(e)));
+  }
+}
+
 /* ================== APP ================== */
 const app = express();
 app.use(express.json());
 
 app.get("/health", async (req, res) => {
   await loadSSOT(false);
-  await initMemoryDbIfNeeded();
+  await memory.init();
 
   res.json({
     ok: true,
@@ -460,16 +333,15 @@ app.get("/health", async (req, res) => {
       intent_suggestions: ssot.data.intent_suggestions.length,
     },
     memory_db: {
-      enabled: memoryDb.enabled,
-      ready: memoryDb.ready,
-      error: memoryDb.error,
-      last_ok_at: memoryDb.last_ok_at,
+      enabled: memory.state.enabled,
+      ready: memory.state.ready,
+      error: memory.state.error,
+      last_ok_at: memory.state.last_ok_at,
     },
     model: OPENAI_REALTIME_MODEL,
   });
 });
 
-// REQUIRED endpoint for Apps Script
 app.post("/admin/reload-sheets", async (req, res) => {
   const started = nowIso();
   await loadSSOT(true);
@@ -513,6 +385,7 @@ wss.on("connection", (twilioWs) => {
   let streamSid = null;
   let callSid = null;
   let callerE164 = null;
+  let calledE164 = null;
 
   const connT0 = Date.now();
   let twilioStartAt = null;
@@ -524,11 +397,11 @@ wss.on("connection", (twilioWs) => {
   let lastResponseCreateAt = 0;
   let userFramesSinceLastCreate = 0;
 
-  // BARGE-IN state
+  // BARGE-IN state + audio drop window
   let speechActive = false;
-  let speechStartedAt = 0;
   let lastBargeinAt = 0;
   let bargeinTimer = null;
+  let dropAudioUntilTs = 0;
 
   // Audio queue
   const audioQueue = [];
@@ -539,12 +412,129 @@ wss.on("connection", (twilioWs) => {
   let asstBuf = "";
   let asstAudioTranscriptBuf = "";
 
-  // Name gate state
-  let expectingName = false;
-  let capturedName = null;
+  // User utterance tracking
+  let lastUserUtterance = "";
 
-  // Closing state
+  // Name/message/callback gates (deterministic)
+  let expectingName = false;
+  let expectingMessage = false;
+  let expectingCallbackConfirm = false;
+  let expectingCallbackNumber = false;
+
+  let capturedName = null;
+  let capturedMessage = null;
+  let callbackRequested = false;
+  let callbackToNumber = null; // digits or e164
   let closingForced = false;
+
+  // Lead/webhook bookkeeping
+  const callStartedAtIso = nowIso();
+  let callEndedAtIso = null;
+  let greetingBucket = getGreetingBucketAndText().bucket;
+
+  let sentCallLog = false;
+  let sentFinal = false;
+  let sentAbandoned = false;
+  let sentPartial = false;
+
+  function safeSend(ws, obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      ws.send(JSON.stringify(obj));
+      return true;
+    } catch (e) {
+      console.error("[OPENAI] send failed", e && (e.message || e));
+      return false;
+    }
+  }
+
+  function flushAudioQueue(openaiWs) {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    if (!openaiReady || !sessionConfigured) return;
+
+    while (audioQueue.length) {
+      const payload = audioQueue.shift();
+      userFramesSinceLastCreate += 1;
+      safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
+    }
+  }
+
+  function maybeCreateResponse(openaiWs, reason) {
+    const now = Date.now();
+    if (responseInFlight) return;
+
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+      pendingCreate = true;
+      return;
+    }
+
+    const DEBOUNCE_MS = 350;
+    const MIN_FRAMES = 4;
+    if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
+    if (userFramesSinceLastCreate < MIN_FRAMES) return;
+
+    lastResponseCreateAt = now;
+    userFramesSinceLastCreate = 0;
+
+    if (closingForced) {
+      safeSend(openaiWs, {
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions: "ענו במשפט קצר ומנומס לסיום השיחה בלבד: תודה ולהתראות.",
+        },
+      });
+      responseInFlight = true;
+      if (MB_DEBUG) console.log("[CLOSING] forced");
+      return;
+    }
+
+    safeSend(openaiWs, { type: "response.create" });
+    pendingCreate = false;
+    responseInFlight = true;
+    if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
+  }
+
+  function cancelAssistant(openaiWs) {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    safeSend(openaiWs, { type: "response.cancel" });
+
+    if (MB_BARGEIN_AUDIO_DROP_MS > 0) {
+      dropAudioUntilTs = Math.max(dropAudioUntilTs, Date.now() + MB_BARGEIN_AUDIO_DROP_MS);
+      if (MB_DEBUG) console.log("[BARGEIN] audio_drop", { ms: MB_BARGEIN_AUDIO_DROP_MS });
+    }
+
+    if (MB_DEBUG) console.log("[BARGEIN] response.cancel");
+  }
+
+  function onSpeechStarted(openaiWs) {
+    speechActive = true;
+
+    if (!MB_BARGEIN_ENABLED) return;
+    if (!responseInFlight) return;
+
+    const now = Date.now();
+    if (now - lastBargeinAt < MB_BARGEIN_COOLDOWN_MS) return;
+
+    if (bargeinTimer) clearTimeout(bargeinTimer);
+    bargeinTimer = setTimeout(() => {
+      if (!speechActive) return;
+      const now2 = Date.now();
+      if (!responseInFlight) return;
+      if (now2 - lastBargeinAt < MB_BARGEIN_COOLDOWN_MS) return;
+
+      lastBargeinAt = now2;
+      cancelAssistant(openaiWs);
+    }, Math.max(0, MB_BARGEIN_MIN_MS));
+  }
+
+  function onSpeechStopped() {
+    speechActive = false;
+    if (bargeinTimer) {
+      clearTimeout(bargeinTimer);
+      bargeinTimer = null;
+    }
+  }
 
   function logSTTLine(line) {
     if (!MB_LOG_TRANSCRIPTS) return;
@@ -583,102 +573,164 @@ wss.on("connection", (twilioWs) => {
     asstAudioTranscriptBuf = "";
   }
 
-  function safeSend(ws, obj) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    try {
-      ws.send(JSON.stringify(obj));
-      return true;
-    } catch (e) {
-      console.error("[OPENAI] send failed", e && (e.message || e));
-      return false;
-    }
+  function buildBasePayload() {
+    const ended = callEndedAtIso || nowIso();
+    const started = callStartedAtIso;
+
+    const durationSec = (() => {
+      try {
+        return Math.max(0, Math.round((new Date(ended) - new Date(started)) / 1000));
+      } catch {
+        return null;
+      }
+    })();
+
+    return {
+      provider_mode: "openai",
+      callSid: callSid || null,
+      streamSid: streamSid || null,
+      call_id: callSid || null,
+      started_at: started,
+      ended_at: ended,
+      duration_sec: Number.isFinite(durationSec) ? durationSec : null,
+      caller_id_e164: callerE164 || null,
+      caller_id_raw: callerE164 || null,
+      called: calledE164 || null,
+      greeting_time_bucket: greetingBucket || null,
+      name: capturedName || null,
+      message: capturedMessage || null,
+      callback_requested: !!callbackRequested,
+      callback_to_number: callbackToNumber || null,
+      notes_internal: null,
+      recording_provider: "twilio",
+      recording_public_url: null,
+    };
   }
 
-  function flushAudioQueue(openaiWs) {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-    if (!openaiReady || !sessionConfigured) return;
-
-    while (audioQueue.length) {
-      const payload = audioQueue.shift();
-      userFramesSinceLastCreate += 1;
-      safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
-    }
+  function isLeadComplete() {
+    if (!capturedName) return false;
+    if (!capturedMessage) return false;
+    if (callbackRequested && !callbackToNumber) return false;
+    return true;
   }
 
-  function maybeCreateResponse(openaiWs, reason) {
-    const now = Date.now();
-    if (responseInFlight) return;
+  async function sendCallLogOnce() {
+    // Per your mapping: ABANDONED_WEBHOOK_URL == CALL_LOG
+    if (sentCallLog) return;
+    if (!ABANDONED_WEBHOOK_URL) return;
+    if (MB_FINAL_WEBHOOK_ONLY) return;
 
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
-      pendingCreate = true;
+    sentCallLog = true;
+    const payload = {
+      event_type: "CALL_LOG",
+      ...buildBasePayload(),
+    };
+    await postJson(ABANDONED_WEBHOOK_URL, payload);
+  }
+
+  async function sendFinalOrPartialOnce() {
+    if (sentFinal || sentPartial) return;
+    if (!FINAL_WEBHOOK_URL) return;
+
+    const complete = isLeadComplete();
+    const payload = {
+      event_type: complete ? "FINAL" : "PARTIAL",
+      lead_type: complete ? "FINAL" : "PARTIAL",
+      ...buildBasePayload(),
+    };
+
+    if (complete) sentFinal = true;
+    else sentPartial = true;
+
+    await postJson(FINAL_WEBHOOK_URL, payload);
+  }
+
+  async function sendAbandonedOnce() {
+    // Per your mapping: CALL_LOG_WEBHOOK_URL == ABANDONED
+    if (sentAbandoned) return;
+    if (!CALL_LOG_WEBHOOK_URL) return;
+
+    sentAbandoned = true;
+    const payload = {
+      event_type: "ABANDONED",
+      ...buildBasePayload(),
+    };
+    await postJson(CALL_LOG_WEBHOOK_URL, payload);
+  }
+
+  function captureUserUtteranceFromTranscriptionEvent(msg) {
+    if (!msg || typeof msg.type !== "string") return;
+    if (!msg.type.toLowerCase().includes("transcription")) return;
+
+    const t =
+      (typeof msg.text === "string" && msg.text) ||
+      (typeof msg.transcript === "string" && msg.transcript) ||
+      "";
+    if (t.trim()) lastUserUtterance = t.trim();
+  }
+
+  function applyDeterministicGatesFromUserUtterance(u) {
+    const text = String(u || "").trim();
+    if (!text) return;
+
+    // closing detection
+    if (isCallerWantsToEnd(text)) closingForced = true;
+
+    // callback detection (if user asks it spontaneously)
+    if (!callbackRequested && isCallbackRequested(text)) {
+      callbackRequested = true;
+      if (MB_DEBUG) console.log("[GATE] callback_requested=true (from user)");
+    }
+
+    // if expecting name
+    if (expectingName && !capturedName) {
+      if (looksLikeName(text)) {
+        capturedName = text;
+        expectingName = false;
+        if (MB_DEBUG) console.log("[NAME] captured", { name: capturedName });
+
+        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
+      } else {
+        if (MB_DEBUG) console.log("[NAME] rejected", { utterance: text });
+      }
       return;
     }
 
-    // KEEP baseline values
-    const DEBOUNCE_MS = 350;
-    const MIN_FRAMES = 4;
-
-    if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
-    if (userFramesSinceLastCreate < MIN_FRAMES) return;
-
-    lastResponseCreateAt = now;
-    userFramesSinceLastCreate = 0;
-
-    // If we already forced closing, we don't let the model roam:
-    if (closingForced) {
-      safeSend(openaiWs, {
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          instructions: "ענו במשפט קצר ומנומס לסיום השיחה בלבד: תודה ולהתראות.",
-        },
-      });
-      responseInFlight = true;
-      if (MB_DEBUG) console.log("[CLOSING] forced");
+    // message capture
+    if (expectingMessage && !capturedMessage) {
+      // very light filter against single-word noise
+      const cleaned = text.replace(/\s+/g, " ").trim();
+      if (cleaned.length >= 2) {
+        capturedMessage = cleaned;
+        expectingMessage = false;
+        if (MB_DEBUG) console.log("[GATE] message_captured", { message: capturedMessage });
+      }
       return;
     }
 
-    safeSend(openaiWs, { type: "response.create" });
-    pendingCreate = false;
-    responseInFlight = true;
-    if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
-  }
+    // callback confirmation
+    if (expectingCallbackConfirm) {
+      if (isYes(text)) {
+        expectingCallbackConfirm = false;
+        callbackToNumber = callerE164 || null;
+        if (MB_DEBUG) console.log("[GATE] callback_confirmed_callerid", { callbackToNumber });
+      } else if (isNo(text)) {
+        expectingCallbackConfirm = false;
+        expectingCallbackNumber = true;
+        if (MB_DEBUG) console.log("[GATE] callback_need_new_number");
+      }
+      return;
+    }
 
-  function cancelAssistant(openaiWs) {
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-    safeSend(openaiWs, { type: "response.cancel" });
-    if (MB_DEBUG) console.log("[BARGEIN] response.cancel");
-  }
-
-  function onSpeechStarted(openaiWs) {
-    speechActive = true;
-    speechStartedAt = Date.now();
-
-    if (!MB_BARGEIN_ENABLED) return;
-    if (!responseInFlight) return;
-
-    const now = Date.now();
-    if (now - lastBargeinAt < MB_BARGEIN_COOLDOWN_MS) return;
-
-    // Noise-resistant gating:
-    // only cancel if speech is still active after MIN_MS (filters short bursts)
-    if (bargeinTimer) clearTimeout(bargeinTimer);
-    bargeinTimer = setTimeout(() => {
-      if (!speechActive) return;
-      const now2 = Date.now();
-      if (!responseInFlight) return;
-      if (now2 - lastBargeinAt < MB_BARGEIN_COOLDOWN_MS) return;
-
-      lastBargeinAt = now2;
-      cancelAssistant(openaiWs);
-    }, Math.max(0, MB_BARGEIN_MIN_MS));
-  }
-
-  function onSpeechStopped() {
-    speechActive = false;
-    if (bargeinTimer) {
-      clearTimeout(bargeinTimer);
-      bargeinTimer = null;
+    // callback number
+    if (expectingCallbackNumber && !callbackToNumber) {
+      const digits = extractILPhoneDigits(text);
+      if (digits) {
+        callbackToNumber = digits;
+        expectingCallbackNumber = false;
+        if (MB_DEBUG) console.log("[GATE] callback_number_captured", { callbackToNumber });
+      }
+      return;
     }
   }
 
@@ -696,27 +748,25 @@ wss.on("connection", (twilioWs) => {
     if (MB_DEBUG) console.log("[OPENAI] ws open");
     openaiReady = true;
 
-    // FAST PATH: do not block on SSOT load if cache exists
     const cache = getSSOTCacheFast();
     if (!cache.ok) {
-      // first-ever load: we must load once (no choice)
       await loadSSOT(true);
     }
 
     const { settings, prompts } = ssot.data;
     const g = getGreetingBucketAndText();
+    greetingBucket = g.bucket;
 
-    // Memory lookup (non-blocking: if fails, proceed normally)
+    // Memory lookup
     let memoryRow = null;
     if (callerE164) {
-      memoryRow = await memoryLookup(callerE164);
+      memoryRow = await memory.lookup(callerE164);
       if (memoryRow && memoryRow.name) {
         if (MB_DEBUG) console.log("[MEMORY] hit", { caller: callerE164, name: memoryRow.name });
       } else {
         if (MB_DEBUG) console.log("[MEMORY] miss", { caller: callerE164 });
       }
-      // upsert call count/last_call_at regardless
-      memoryUpsertCall(callerE164).catch(() => {});
+      memory.upsertCall(callerE164).catch(() => {});
     }
 
     // OPENING
@@ -725,7 +775,7 @@ wss.on("connection", (twilioWs) => {
 
     let opening = "";
     if (memoryRow && memoryRow.name) {
-      // If returning template exists use it; else use approved default text.
+      capturedName = memoryRow.name; // prefill name gate for returning caller
       if (String(returningTemplate || "").trim()) {
         opening = injectVars(returningTemplate, {
           GREETING: g.text,
@@ -793,13 +843,15 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
+    // CALL_LOG (per your mapping it goes to ABANDONED_WEBHOOK_URL)
+    sendCallLogOnce().catch(() => {});
+
     // Opening: speak immediately (no extra pre-say)
     safeSend(openaiWs, {
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
-        instructions:
-          "דברי עכשיו את הטקסט הבא ללא תוספות לפני/אחרי, באותו ניסוח בדיוק:\n" + opening,
+        instructions: "דברי עכשיו את הטקסט הבא ללא תוספות לפני/אחרי, באותו ניסוח בדיוק:\n" + opening,
       },
     });
 
@@ -825,7 +877,10 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // STT transcription (defensive)
+    // capture user utterance
+    captureUserUtteranceFromTranscriptionEvent(msg);
+
+    // STT logs + keep lastUserUtterance fresh
     if (MB_LOG_TRANSCRIPTS) {
       if (msg && typeof msg.type === "string" && msg.type.toLowerCase().includes("transcription")) {
         if (typeof msg.delta === "string") sttBuf += msg.delta;
@@ -864,6 +919,34 @@ wss.on("connection", (twilioWs) => {
 
       if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
         logAsstAudioTranscriptDelta(msg.delta);
+
+        // deterministically detect prompts from assistant to set gates
+        const d = msg.delta;
+
+        if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
+          if (!capturedName) {
+            expectingName = true;
+            if (MB_DEBUG) console.log("[NAME] expecting_name");
+          }
+        }
+
+        if (/מה הנושא|מה תרצה שאעביר|מה תרצו שאעביר|מה למסור/.test(d)) {
+          expectingMessage = true;
+          if (MB_DEBUG) console.log("[GATE] expecting_message");
+        }
+
+        if (/נוח לחזור למספר שממנו התקשר/.test(d)) {
+          callbackRequested = true;
+          expectingCallbackConfirm = true;
+          if (MB_DEBUG) console.log("[GATE] expecting_callback_confirm");
+        }
+
+        if (/מה המספר|מספר טלפון|מספר לחזרה/.test(d)) {
+          if (callbackRequested && !callbackToNumber) {
+            expectingCallbackNumber = true;
+            if (MB_DEBUG) console.log("[GATE] expecting_callback_number");
+          }
+        }
       }
       if (msg.type === "response.audio_transcript.done") {
         flushAsstAudioTranscriptLine();
@@ -875,25 +958,48 @@ wss.on("connection", (twilioWs) => {
       }
     }
 
-    // BARGE-IN hooks (if available)
+    // BARGE-IN hooks
     if (msg.type === "input_audio_buffer.speech_started") {
       onSpeechStarted(openaiWs);
       return;
     }
+
     if (msg.type === "input_audio_buffer.speech_stopped") {
       onSpeechStopped();
+
+      // apply gates from last user utterance
+      if (lastUserUtterance) {
+        applyDeterministicGatesFromUserUtterance(lastUserUtterance);
+      }
+
+      // if user is ending and we have enough info, send FINAL/PARTIAL immediately
+      if (closingForced) {
+        callEndedAtIso = nowIso();
+
+        if (capturedName && capturedMessage) {
+          sendFinalOrPartialOnce().catch(() => {});
+        } else {
+          // If no name -> abandoned. Else partial to FINAL_WEBHOOK_URL.
+          if (!capturedName) sendAbandonedOnce().catch(() => {});
+          else sendFinalOrPartialOnce().catch(() => {});
+        }
+      }
+
       maybeCreateResponse(openaiWs, "speech_stopped");
       return;
     }
 
-    // When model finished speaking, allow next user turn
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
       return;
     }
 
-    // AUDIO OUT (DO NOT TOUCH)
+    // AUDIO OUT (DO NOT TOUCH) – but allow drop window after barge-in cancel
     if (msg.type === "response.audio.delta" && streamSid) {
+      if (dropAudioUntilTs && Date.now() < dropAudioUntilTs) {
+        return; // drop audio frames
+      }
+
       try {
         twilioWs.send(
           JSON.stringify({
@@ -918,24 +1024,6 @@ wss.on("connection", (twilioWs) => {
     if (MB_DEBUG) console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
-  // Track last user STT for name/closing decisions (simple: rely on MB_LOG_TRANSCRIPTS events above isn't enough)
-  // We'll infer from the raw transcription "text" event by capturing it here:
-  let lastUserUtterance = "";
-
-  // We can capture user utterance if transcription sends msg.text/msg.transcript,
-  // but we already parse those above without storing. Add a lightweight store:
-  function captureUserUtteranceFromTranscriptionEvent(msg) {
-    if (!msg || typeof msg.type !== "string") return;
-    if (!msg.type.toLowerCase().includes("transcription")) return;
-
-    const t = (typeof msg.text === "string" && msg.text) || (typeof msg.transcript === "string" && msg.transcript) || "";
-    if (t.trim()) lastUserUtterance = t.trim();
-  }
-
-  // Patch capture inside openaiWs message pipeline by re-parsing last seen msg:
-  // (We don't want to restructure too much; just do it here on next tick via twilio audio stop? Not needed.)
-  // Instead: capture lastUserUtterance on speech_stopped by using sttBuf fallback (best effort).
-
   twilioWs.on("message", (raw) => {
     let msg;
     try {
@@ -950,7 +1038,10 @@ wss.on("connection", (twilioWs) => {
       twilioStartAt = Date.now();
 
       const callerRaw = msg.start?.customParameters?.caller || msg.start?.caller || null;
-      callerE164 = normalizeE164(callerRaw);
+      const calledRaw = msg.start?.customParameters?.called || msg.start?.called || null;
+
+      callerE164 = memory.normalizeE164(callerRaw);
+      calledE164 = memory.normalizeE164(calledRaw);
 
       if (MB_DEBUG) {
         console.log("[WS] start", {
@@ -983,71 +1074,32 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (msg.event === "stop") {
+      callEndedAtIso = nowIso();
+
       if (MB_DEBUG) console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
+
+      // Decide what to send on call end if not already sent
+      (async () => {
+        // If user left with no name -> ABANDONED
+        if (!capturedName) {
+          await sendAbandonedOnce();
+          return;
+        }
+
+        // Has name but not complete -> PARTIAL to FINAL_WEBHOOK_URL
+        if (!isLeadComplete()) {
+          await sendFinalOrPartialOnce();
+          return;
+        }
+
+        // Complete -> FINAL
+        await sendFinalOrPartialOnce();
+      })().catch(() => {});
+
       try {
         if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
       } catch {}
       return;
-    }
-  });
-
-  // Extra: if we have transcription text arriving (best effort), do simple state actions.
-  // Because OpenAI events vary, we add a second listener that tries to store utterances.
-  openaiWs.on("message", (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-
-    captureUserUtteranceFromTranscriptionEvent(msg);
-
-    // Detect caller wants to end (code-level closing lock)
-    if (typeof lastUserUtterance === "string" && lastUserUtterance) {
-      if (isCallerWantsToEnd(lastUserUtterance)) {
-        closingForced = true;
-      }
-    }
-
-    // Name capture helper (when the model is asking for name, we help enforce it safely)
-    // We activate expectingName when we hear the assistant ask for a name in audio_transcript (best-effort).
-    if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
-      const d = msg.delta;
-      if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
-        expectingName = true;
-        if (MB_DEBUG) console.log("[NAME] expecting_name");
-      }
-    }
-
-    // On speech_stopped, if expectingName and we have a recent user utterance, validate it as a name
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      const u = String(lastUserUtterance || "").trim();
-      if (expectingName && u) {
-        if (looksLikeName(u)) {
-          capturedName = u;
-          expectingName = false;
-          if (MB_DEBUG) console.log("[NAME] captured", { name: capturedName });
-
-          // Save to memory
-          if (callerE164) memorySaveName(callerE164, capturedName).catch(() => {});
-        } else {
-          // reject and force a short re-ask (one question)
-          expectingName = true;
-          if (MB_DEBUG) console.log("[NAME] rejected", { utterance: u });
-
-          if (openaiWs.readyState === WebSocket.OPEN) {
-            safeSend(openaiWs, {
-              type: "response.create",
-              response: {
-                modalities: ["audio", "text"],
-                instructions: "עני בעברית בלשון רבים, במשפט אחד בלבד: נשמח לדעת איך אפשר לפנות אליכם — מה השם בבקשה?",
-              },
-            });
-            responseInFlight = true;
-          }
-        }
-      }
     }
   });
 
