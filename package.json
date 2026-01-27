@@ -1,7 +1,7 @@
 {
   "name": "index-betty-voicebot",
   "version": "1.1.1",
-  "description": "Index Betty VoiceBot - Realtime (OpenAI + SSOT)",
+  "description": "Index Betty VoiceBot - Realtime WS (Twilio Media Streams + OpenAI) + SSOT + Memory",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0",
-    "googleapis": "^140.0.0"
+    "googleapis": "^140.0.0",
+    "pg": "^8.13.1",
+    "ws": "^8.18.0"
   }
 }
