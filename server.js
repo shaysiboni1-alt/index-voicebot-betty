@@ -1,465 +1,259 @@
-// server.js
-// Index VoiceBot – Betty (Realtime Voice Bot)
-// Stage: SSOT (Google Sheets) READ-ONLY integration
-//
-// Notes:
-// - Keeps existing OpenAI Realtime streaming flow.
-// - Adds SSOT loader (SETTINGS/PROMPTS/INTENTS/INTENT_SUGGESTIONS) via Google Service Account (read-only).
-// - No writes to Sheets in this stage.
+/**
+ * Index VoiceBot – Betty
+ * Runtime: Node (CommonJS), Express, WebSocket
+ * - /health: service status + SSOT load summary
+ * - /twilio-media-stream: Twilio Media Streams ingress (mulaw 8k)
+ *
+ * SSOT (READ ONLY):
+ * - GSHEET_ID
+ * - GOOGLE_SERVICE_ACCOUNT_JSON_B64 (base64 of service account JSON)
+ *
+ * Tabs expected:
+ * - SETTINGS (key,value)
+ * - PROMPTS (prompt_id,content_he)
+ * - INTENTS (intent,priority,trigger_type,triggers_he,notes)
+ * - INTENT_SUGGESTIONS (phrase_he,detected_intent,occurrences,last_seen_at,approved,notes)  // read only for now
+ */
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
 
+const SERVICE_NAME = process.env.SERVICE_NAME || "index-betty-voicebot";
 const PORT = process.env.PORT || 10000;
 
-// ---- ENV (Runtime) ----
-const TIME_ZONE = process.env.TIME_ZONE || "Asia/Jerusalem";
-const PROVIDER_MODE = (process.env.PROVIDER_MODE || "openai").trim(); // openai|gemini|hybrid
+const MB_DEBUG = String(process.env.MB_DEBUG || "false").toLowerCase() === "true";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
-
-// Optional STT settings for OpenAI Realtime
-const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
-const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
-
-// VAD tuning
-const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
-const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 900);
-const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
-
-// SSOT (Google Sheets)
-const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
-const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
-const SSOT_REFRESH_MS = Number(process.env.SSOT_REFRESH_MS || 60_000);
-
-// Basic sanity
-if (!OPENAI_API_KEY) {
-  console.error("[FATAL] Missing OPENAI_API_KEY");
-  process.exit(1);
-}
-
-// ---- Helpers ----
 function nowIso() {
   return new Date().toISOString();
 }
 
-function safeJsonParse(str) {
+function safeString(v) {
+  if (v === undefined || v === null) return "";
+  return String(v).trim();
+}
+
+function decodeServiceAccountJson() {
+  const b64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64;
+  if (!b64) return null;
   try {
-    return JSON.parse(str);
-  } catch {
+    const raw = Buffer.from(b64, "base64").toString("utf8");
+    return JSON.parse(raw);
+  } catch (e) {
     return null;
   }
 }
 
-function decodeServiceAccountJson() {
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON_B64) return null;
-  const raw = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
-  const obj = safeJsonParse(raw);
-  return obj && obj.client_email && obj.private_key ? obj : null;
-}
-
-function getGreetingBucketAndText() {
-  let hour = 0;
-  try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: TIME_ZONE,
-      hour12: false,
-      hour: "2-digit",
-    }).formatToParts(new Date());
-    const hh = parts.find((p) => p.type === "hour")?.value;
-    hour = Number(hh || 0);
-  } catch {
-    hour = new Date().getHours();
-  }
-
-  let bucket = "morning";
-  let text = "בוקר טוב";
-  if (hour >= 12 && hour < 17) {
-    bucket = "afternoon";
-    text = "צהריים טובים";
-  } else if (hour >= 17 && hour < 22) {
-    bucket = "evening";
-    text = "ערב טוב";
-  } else if (hour >= 22 || hour < 5) {
-    bucket = "night";
-    text = "לילה טוב";
-  }
-  return { bucket, text };
-}
-
-// ---- SSOT State ----
+/** -------------------------
+ * SSOT loader (READ ONLY)
+ * ------------------------*/
 const ssot = {
-  enabled: Boolean(GSHEET_ID && GOOGLE_SERVICE_ACCOUNT_JSON_B64),
+  enabled: false,
   loaded_at: null,
   error: null,
-  settings: {},               // key->value
-  prompts: {},                // prompt_id->content_he
-  intents: [],                // rows
-  intent_suggestions: [],     // rows
+  settings: {},
+  prompts: {},
+  intents: [],
+  intent_suggestions: [],
+  counts: {
+    settings_keys: 0,
+    prompts_keys: 0,
+    intents: 0,
+    intent_suggestions: 0,
+  },
 };
 
-async function ssotAuthClient() {
+async function loadSSOT() {
+  const spreadsheetId = safeString(process.env.GSHEET_ID);
   const sa = decodeServiceAccountJson();
-  if (!sa) throw new Error("Invalid GOOGLE_SERVICE_ACCOUNT_JSON_B64 (expected base64 JSON with client_email/private_key)");
-  const scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"];
-  const jwt = new google.auth.JWT(sa.client_email, null, sa.private_key, scopes);
-  await jwt.authorize();
-  return jwt;
-}
 
-function rowsToKeyValue(rows) {
-  const out = {};
-  for (const r of rows || []) {
-    const k = (r?.[0] || "").toString().trim();
-    const v = (r?.[1] || "").toString().trim();
-    if (!k || k.toLowerCase() === "key") continue;
-    out[k] = v;
-  }
-  return out;
-}
-
-async function loadSsotOnce() {
-  if (!ssot.enabled) return;
-
-  const auth = await ssotAuthClient();
-  const sheets = google.sheets({ version: "v4", auth });
-
-  const ranges = [
-    "SETTINGS!A:B",
-    "PROMPTS!A:B",
-    "INTENTS!A:E",
-    "INTENT_SUGGESTIONS!A:F",
-  ];
-
-  const res = await sheets.spreadsheets.values.batchGet({
-    spreadsheetId: GSHEET_ID,
-    ranges,
-    majorDimension: "ROWS",
-  });
-
-  const valueRanges = res.data.valueRanges || [];
-  const byRange = {};
-  for (const vr of valueRanges) {
-    byRange[vr.range] = vr.values || [];
-  }
-
-  // SETTINGS
-  const settingsRows = byRange["SETTINGS!A:B"] || byRange["SETTINGS!A:B"] || [];
-  ssot.settings = rowsToKeyValue(settingsRows);
-
-  // PROMPTS
-  const promptsRows = byRange["PROMPTS!A:B"] || [];
-  const prompts = {};
-  for (const r of promptsRows || []) {
-    const id = (r?.[0] || "").toString().trim();
-    const content = (r?.[1] || "").toString();
-    if (!id || id.toLowerCase() === "prompt_id") continue;
-    prompts[id] = content;
-  }
-  ssot.prompts = prompts;
-
-  // INTENTS
-  const intentsRows = byRange["INTENTS!A:E"] || [];
-  const intents = [];
-  for (const r of intentsRows || []) {
-    const intent = (r?.[0] || "").toString().trim();
-    if (!intent || intent.toLowerCase() === "intent") continue;
-    intents.push({
-      intent,
-      priority: Number(r?.[1] || 0),
-      trigger_type: (r?.[2] || "").toString().trim(),
-      triggers_he: (r?.[3] || "").toString().trim(),
-      notes: (r?.[4] || "").toString().trim(),
-    });
-  }
-  ssot.intents = intents;
-
-  // INTENT_SUGGESTIONS (read-only for now)
-  const sugRows = byRange["INTENT_SUGGESTIONS!A:F"] || [];
-  const suggestions = [];
-  for (const r of sugRows || []) {
-    const phrase_he = (r?.[0] || "").toString().trim();
-    if (!phrase_he || phrase_he.toLowerCase() === "phrase_he") continue;
-    suggestions.push({
-      phrase_he,
-      detected_intent: (r?.[1] || "").toString().trim(),
-      occurrences: Number(r?.[2] || 0),
-      last_seen_at: (r?.[3] || "").toString().trim(),
-      approved: (r?.[4] || "").toString().trim(),
-      notes: (r?.[5] || "").toString().trim(),
-    });
-  }
-  ssot.intent_suggestions = suggestions;
-
-  ssot.loaded_at = nowIso();
+  ssot.enabled = Boolean(spreadsheetId && sa);
+  ssot.loaded_at = null;
   ssot.error = null;
-  console.log("[SSOT] loaded", {
-    loaded_at: ssot.loaded_at,
-    settings_keys: Object.keys(ssot.settings || {}).length,
-    prompts_keys: Object.keys(ssot.prompts || {}).length,
-    intents: ssot.intents.length,
-    intent_suggestions: ssot.intent_suggestions.length,
-  });
-}
+  ssot.settings = {};
+  ssot.prompts = {};
+  ssot.intents = [];
+  ssot.intent_suggestions = [];
+  ssot.counts = { settings_keys: 0, prompts_keys: 0, intents: 0, intent_suggestions: 0 };
 
-async function startSsotLoop() {
   if (!ssot.enabled) {
-    console.log("[SSOT] disabled (missing GSHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON_B64)");
+    ssot.error = "SSOT disabled: missing GSHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON_B64";
     return;
   }
+
   try {
-    await loadSsotOnce();
-  } catch (e) {
-    ssot.error = e?.message || String(e);
-    console.error("[SSOT] load failed:", ssot.error);
-  }
-  setInterval(async () => {
-    try {
-      await loadSsotOnce();
-    } catch (e) {
-      ssot.error = e?.message || String(e);
-      console.error("[SSOT] refresh failed:", ssot.error);
+    const auth = new google.auth.JWT({
+      email: sa.client_email,
+      key: sa.private_key,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    });
+
+    const sheets = google.sheets({ version: "v4", auth });
+
+    async function getValues(tab) {
+      const res = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `${tab}!A1:Z`,
+      });
+      return Array.isArray(res.data.values) ? res.data.values : [];
     }
-  }, SSOT_REFRESH_MS);
+
+    // SETTINGS
+    const settingsRows = await getValues("SETTINGS");
+    for (let i = 1; i < settingsRows.length; i++) {
+      const row = settingsRows[i] || [];
+      const k = safeString(row[0]);
+      const v = safeString(row[1]);
+      if (!k) continue;
+      if (!v) continue;
+      ssot.settings[k] = v;
+    }
+
+    // PROMPTS
+    const promptsRows = await getValues("PROMPTS");
+    for (let i = 1; i < promptsRows.length; i++) {
+      const row = promptsRows[i] || [];
+      const promptId = safeString(row[0]);
+      const contentHe = safeString(row[1]);
+      if (!promptId) continue;
+      if (!contentHe) continue;
+      ssot.prompts[promptId] = contentHe;
+    }
+
+    // INTENTS
+    const intentsRows = await getValues("INTENTS");
+    for (let i = 1; i < intentsRows.length; i++) {
+      const row = intentsRows[i] || [];
+      const intent = safeString(row[0]);
+      if (!intent) continue;
+
+      const priority = Number(safeString(row[1]) || "0");
+      const trigger_type = safeString(row[2]);
+      const triggers_he_raw = safeString(row[3]);
+      const notes = safeString(row[4]);
+
+      const triggers_he = triggers_he_raw
+        ? triggers_he_raw.split(",").map(s => safeString(s)).filter(Boolean)
+        : [];
+
+      ssot.intents.push({ intent, priority, trigger_type, triggers_he, notes });
+    }
+
+    // INTENT_SUGGESTIONS (read-only)
+    const suggRows = await getValues("INTENT_SUGGESTIONS");
+    for (let i = 1; i < suggRows.length; i++) {
+      const row = suggRows[i] || [];
+      const phrase_he = safeString(row[0]);
+      if (!phrase_he) continue;
+      ssot.intent_suggestions.push({
+        phrase_he,
+        detected_intent: safeString(row[1]),
+        occurrences: Number(safeString(row[2]) || "0"),
+        last_seen_at: safeString(row[3]),
+        approved: safeString(row[4]),
+        notes: safeString(row[5]),
+      });
+    }
+
+    ssot.counts.settings_keys = Object.keys(ssot.settings).length;
+    ssot.counts.prompts_keys = Object.keys(ssot.prompts).length;
+    ssot.counts.intents = ssot.intents.length;
+    ssot.counts.intent_suggestions = ssot.intent_suggestions.length;
+
+    ssot.loaded_at = nowIso();
+    ssot.error = null;
+  } catch (e) {
+    ssot.loaded_at = nowIso();
+    ssot.error = e && (e.message || String(e)) || "unknown error";
+  }
 }
 
-// ---- Express ----
+/** Auto-load on startup */
+loadSSOT().catch(() => {});
+
+/** Optional: periodic refresh */
+const SSOT_REFRESH_SEC = Number(process.env.SSOT_REFRESH_SEC || "300");
+if (SSOT_REFRESH_SEC > 0) {
+  setInterval(() => {
+    loadSSOT().catch(() => {});
+  }, SSOT_REFRESH_SEC * 1000);
+}
+
+/** -------------------------
+ * HTTP server
+ * ------------------------*/
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (req, res) => {
-  res.json({
+  const payload = {
     ok: true,
-    service: "index-betty-voicebot",
+    service: SERVICE_NAME,
     ts: nowIso(),
-    provider_mode: PROVIDER_MODE,
+    provider_mode: safeString(process.env.PROVIDER_MODE || "openai"),
     ssot: {
       enabled: ssot.enabled,
       loaded_at: ssot.loaded_at,
       error: ssot.error,
-      settings_keys: Object.keys(ssot.settings || {}).length,
-      prompts_keys: Object.keys(ssot.prompts || {}).length,
-      intents: ssot.intents.length,
-      intent_suggestions: ssot.intent_suggestions.length,
+      settings_keys: ssot.counts.settings_keys,
+      prompts_keys: ssot.counts.prompts_keys,
+      intents: ssot.counts.intents,
+      intent_suggestions: ssot.counts.intent_suggestions,
+    },
+  };
+
+  // Debug helper (never include secrets)
+  if (MB_DEBUG) {
+    payload.ssot.sample = {
+      settings_keys: Object.keys(ssot.settings).slice(0, 10),
+      prompts_keys: Object.keys(ssot.prompts).slice(0, 10),
+      intents: ssot.intents.slice(0, 5).map(x => x.intent),
+    };
+  }
+
+  res.json(payload);
+});
+
+/** Manual SSOT refresh (read-only) */
+app.post("/ssot/refresh", async (req, res) => {
+  await loadSSOT();
+  res.json({
+    ok: true,
+    ts: nowIso(),
+    ssot: {
+      enabled: ssot.enabled,
+      loaded_at: ssot.loaded_at,
+      error: ssot.error,
+      ...ssot.counts,
     },
   });
 });
 
-// ---- HTTP + WS (Twilio Media Streams -> OpenAI Realtime) ----
+/** -------------------------
+ * WebSocket server placeholder
+ * (kept minimal; SSOT scope only)
+ * ------------------------*/
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-// OpenAI Realtime WS URL
-const OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=" + encodeURIComponent(OPENAI_REALTIME_MODEL);
+wss.on("connection", (ws) => {
+  if (MB_DEBUG) console.log("[WS] connection established");
 
-// Turn gating: never call response.create before OpenAI WS is OPEN
-function safeSend(ws, obj, label) {
-  try {
-    if (ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify(obj));
-    if (label) console.log("[SEND]", label);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function buildSessionUpdate() {
-  // Pull dynamic scripts from SSOT if present (fallbacks are safe)
-  const opening = (ssot.settings.OPENING_SCRIPT || "").trim();
-  const noData = (ssot.settings.NO_DATA_MESSAGE || "אין לי מידע זמין כרגע.").trim();
-  const master = (ssot.prompts.MASTER_PROMPT || "").trim();
-
-  // We will only inject small context placeholders; runtime logic uses full prompts later stages.
-  const systemPreamble = [
-    master,
-    "אם אין לך הוראות אחרות, תפעלי לפי SSOT בלבד.",
-    `אם חסר מידע: אמרי בקצרה: "${noData}".`,
-    opening ? `פתיח לשימוש: "${opening}"` : "",
-  ].filter(Boolean).join(" ");
-
-  const session = {
-    type: "session.update",
-    session: {
-      // voice
-      voice: OPENAI_VOICE,
-      // turn detection
-      turn_detection: {
-        type: "server_vad",
-        threshold: MB_VAD_THRESHOLD,
-        prefix_padding_ms: MB_VAD_PREFIX_MS,
-        silence_duration_ms: MB_VAD_SILENCE_MS,
-      },
-      // modalities
-      modalities: ["text", "audio"],
-      // language bias via system text
-      instructions: systemPreamble,
-    },
-  };
-
-  // Realtime STT
-  if (MB_TRANSCRIPTION_MODEL) {
-    session.session.input_audio_transcription = {
-      model: MB_TRANSCRIPTION_MODEL,
-      language: MB_TRANSCRIPTION_LANGUAGE || "he",
-    };
-  }
-
-  return session;
-}
-
-wss.on("connection", (twilioWs) => {
-  console.log("[WS] connection established");
-
-  let callSid = "";
-  let streamSid = "";
-  let caller = "";
-  let called = "";
-  let source = "";
-  let startedAt = nowIso();
-
-  // OpenAI WS state
-  let openaiWs = null;
-  let openaiOpen = false;
-  const pending = []; // queue of JSON-serializable messages to send after open
-
-  function enqueueOrSend(obj, label) {
-    if (openaiWs && openaiOpen) {
-      safeSend(openaiWs, obj, label);
-    } else {
-      pending.push({ obj, label });
-    }
-  }
-
-  function flushPending() {
-    if (!openaiWs || !openaiOpen) return;
-    while (pending.length) {
-      const { obj, label } = pending.shift();
-      safeSend(openaiWs, obj, label);
-    }
-  }
-
-  function connectOpenAI() {
-    openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    });
-
-    openaiWs.on("open", () => {
-      openaiOpen = true;
-      console.log("[OPENAI] ws open");
-      // 1) session.update
-      enqueueOrSend(buildSessionUpdate(), "session.update");
-      // 2) Start a first response only after open (queue-safe)
-      enqueueOrSend({ type: "response.create" }, "response.create (boot)");
-      flushPending();
-    });
-
-    openaiWs.on("message", (data) => {
-      let msg = null;
-      try {
-        msg = JSON.parse(data.toString("utf8"));
-      } catch {
-        return;
-      }
-
-      // Audio out -> Twilio
-      if (msg.type === "response.audio.delta" && msg.delta) {
-        try {
-          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
-        } catch {}
-      }
-
-      // Basic debug for turn events
-      if (msg.type === "response.create" || msg.type?.includes("speech_")) {
-        console.log("[TURN]", msg.type);
-      }
-    });
-
-    openaiWs.on("close", (e) => {
-      openaiOpen = false;
-      console.log("[OPENAI] ws closed", { code: e?.code, reason: e?.reason || "" });
-    });
-
-    openaiWs.on("error", (e) => {
-      console.log("[OPENAI] ws error", e?.message || e);
-    });
-  }
-
-  connectOpenAI();
-
-  twilioWs.on("message", (msg) => {
-    let data = null;
-    try {
-      data = JSON.parse(msg.toString("utf8"));
-    } catch {
-      return;
-    }
-
-    if (data.event === "start") {
-      streamSid = data.start?.streamSid || "";
-      callSid = data.start?.callSid || data.start?.customParameters?.callSid || "";
-      caller = data.start?.customParameters?.caller || "";
-      called = data.start?.customParameters?.called || "";
-      source = data.start?.customParameters?.source || "";
-      startedAt = nowIso();
-
-      console.log("[WS] start", {
-        streamSid,
-        callSid,
-        tracks: data.start?.tracks,
-        mediaFormat: data.start?.mediaFormat,
-        customParameters: data.start?.customParameters,
-      });
-
-      // For future stages: use SSOT OPENING_SCRIPT with greeting bucket. For now, Realtime handles via instructions.
-      return;
-    }
-
-    if (data.event === "media") {
-      // Forward inbound audio to OpenAI
-      const payload = data.media?.payload;
-      if (!payload) return;
-
-      enqueueOrSend({ type: "input_audio_buffer.append", audio: payload }, "input_audio_buffer.append");
-      // Let server_vad decide when to respond (OpenAI handles)
-      flushPending();
-      return;
-    }
-
-    if (data.event === "stop") {
-      console.log("[WS] stop", { callSid });
-      try {
-        if (openaiWs) openaiWs.close(1000, "twilio_stop");
-      } catch {}
-      try {
-        twilioWs.close();
-      } catch {}
-      return;
-    }
+  ws.on("message", () => {
+    // SSOT task: no realtime routing here. Your existing voice runtime can live in this endpoint.
   });
 
-  twilioWs.on("close", () => {
-    console.log("[WS] closed");
-    try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_ws_closed");
-    } catch {}
+  ws.on("close", () => {
+    if (MB_DEBUG) console.log("[WS] closed");
   });
 
-  twilioWs.on("error", (e) => {
-    console.log("[WS] error", e?.message || e);
+  ws.on("error", (err) => {
+    console.log("[WS] error", err && (err.message || err));
   });
 });
 
 server.listen(PORT, () => {
   console.log(`==> Service live on port ${PORT}`);
-  console.log(`==> Health: https://index-voicebot-betty.onrender.com/health`);
-  startSsotLoop().catch((e) => console.error("[SSOT] loop failed", e?.message || e));
+  console.log(`==> Health: https://${process.env.RENDER_EXTERNAL_HOSTNAME || "YOUR_RENDER_HOST"}/health`);
 });
