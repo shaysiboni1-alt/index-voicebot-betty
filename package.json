@@ -1,7 +1,7 @@
 {
   "name": "index-betty-voicebot",
   "version": "1.0.0",
-  "private": true,
+  "description": "Index Betty VoiceBot - minimal WS stub (Twilio Media Streams)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0",
-    "googleapis": "^137.0.0"
+    "ws": "^8.18.0"
   }
 }
