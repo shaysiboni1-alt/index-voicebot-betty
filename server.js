@@ -3,8 +3,9 @@
 // Baseline preserved (audio queue, VAD, debounce gates).
 // Adds ONLY:
 // A) STT transcript logs (from Realtime events) controlled by ENV
-// B) Assistant text logs controlled by ENV
+// B) Assistant text logs controlled by ENV  (NOW includes audio_transcript)
 // C) POST /admin/reload-sheets (force SSOT reload) for Apps Script
+// D) SSOT prewarm + cache-first on call open to reduce opening latency (safe fallback to force reload)
 
 const express = require("express");
 const http = require("http");
@@ -160,6 +161,18 @@ async function loadSSOT(force = false) {
   return ssot;
 }
 
+// PREWARM SSOT at server startup (non-blocking)
+(async () => {
+  if (!ssot.enabled) return;
+  try {
+    const t0 = Date.now();
+    await loadSSOT(false);
+    if (MB_DEBUG) console.log("[SSOT] prewarm done in", Date.now() - t0, "ms");
+  } catch (e) {
+    console.error("[SSOT] prewarm failed", e && (e.message || e));
+  }
+})();
+
 function injectVars(text, vars) {
   let out = String(text || "");
   for (const [k, v] of Object.entries(vars || {})) {
@@ -178,7 +191,7 @@ const app = express();
 app.use(express.json());
 
 app.get("/health", async (req, res) => {
-  await loadSSOT();
+  await loadSSOT(false);
   res.json({
     ok: true,
     service: "index-betty-voicebot",
@@ -241,6 +254,11 @@ wss.on("connection", (twilioWs) => {
   let streamSid = null;
   let callSid = null;
 
+  // for latency measurement
+  const connT0 = Date.now();
+  let twilioStartAt = null;
+  let openingSentAt = null;
+
   // OpenAI session readiness gates
   let openaiReady = false;       // WS open
   let sessionConfigured = false; // after we send session.update
@@ -256,6 +274,7 @@ wss.on("connection", (twilioWs) => {
   // Transcript aggregation (defensive: event names may differ)
   let sttBuf = "";
   let asstBuf = "";
+  let asstAudioTranscriptBuf = "";
 
   function logSTTLine(line) {
     if (!MB_LOG_TRANSCRIPTS) return;
@@ -269,7 +288,6 @@ wss.on("connection", (twilioWs) => {
     const d = String(delta || "");
     if (!d) return;
     asstBuf += d;
-    // print streaming deltas on same line:
     process.stdout.write(d);
   }
 
@@ -278,6 +296,21 @@ wss.on("connection", (twilioWs) => {
     const t = String(asstBuf || "").trim();
     if (t) process.stdout.write("\n");
     asstBuf = "";
+  }
+
+  function logAsstAudioTranscriptDelta(delta) {
+    if (!MB_LOG_ASSISTANT_TEXT) return;
+    const d = String(delta || "");
+    if (!d) return;
+    asstAudioTranscriptBuf += d;
+    process.stdout.write(d);
+  }
+
+  function flushAsstAudioTranscriptLine() {
+    if (!MB_LOG_ASSISTANT_TEXT) return;
+    const t = String(asstAudioTranscriptBuf || "").trim();
+    if (t) process.stdout.write("\n");
+    asstAudioTranscriptBuf = "";
   }
 
   function safeSend(ws, obj) {
@@ -342,8 +375,16 @@ wss.on("connection", (twilioWs) => {
     if (MB_DEBUG) console.log("[OPENAI] ws open");
     openaiReady = true;
 
-    // Force SSOT refresh at session start
-    await loadSSOT(true);
+    // Cache-first SSOT for low latency
+    await loadSSOT(false);
+
+    // SAFE fallback: if cache is empty or error, force reload (preserves behavior)
+    const cachedSettingsKeys = Object.keys(ssot.data.settings || {}).length;
+    const cachedPromptsKeys = Object.keys(ssot.data.prompts || {}).length;
+    if (ssot.error || cachedSettingsKeys === 0 || cachedPromptsKeys === 0) {
+      if (MB_DEBUG) console.log("[SSOT] cache empty/error -> force reload");
+      await loadSSOT(true);
+    }
 
     const { settings, prompts } = ssot.data;
 
@@ -407,6 +448,7 @@ wss.on("connection", (twilioWs) => {
     sessionConfigured = true;
 
     // VERBATIM opening: force speak exactly opening
+    openingSentAt = Date.now();
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -416,6 +458,15 @@ wss.on("connection", (twilioWs) => {
           opening,
       },
     });
+
+    if (MB_DEBUG) {
+      const tSinceConn = Date.now() - connT0;
+      const tSinceStart = twilioStartAt ? (Date.now() - twilioStartAt) : null;
+      console.log("[LATENCY] opening response.create sent", {
+        ms_since_ws_connection: tSinceConn,
+        ms_since_twilio_start: tSinceStart,
+      });
+    }
 
     responseInFlight = true;
     flushAudioQueue(openaiWs);
@@ -432,16 +483,10 @@ wss.on("connection", (twilioWs) => {
 
     // ======== LOGGING (defensive, supports multiple event names) ========
     if (MB_LOG_TRANSCRIPTS) {
-      // Common patterns:
-      // - msg.type includes "transcription" and has msg.text
-      // - msg.type includes "transcription" and has msg.delta
-      // - msg.type includes "transcription" and has msg.transcript
       if (msg && typeof msg.type === "string" && msg.type.toLowerCase().includes("transcription")) {
-        if (typeof msg.delta === "string") {
-          sttBuf += msg.delta;
-        }
+        if (typeof msg.delta === "string") sttBuf += msg.delta;
+
         if (typeof msg.text === "string") {
-          // sometimes full text arrives as msg.text
           logSTTLine(msg.text);
           sttBuf = "";
         }
@@ -449,7 +494,7 @@ wss.on("connection", (twilioWs) => {
           logSTTLine(msg.transcript);
           sttBuf = "";
         }
-        // finalize buffers on likely "done"/"completed"/"result"
+
         if (
           msg.type.toLowerCase().includes("done") ||
           msg.type.toLowerCase().includes("completed") ||
@@ -462,10 +507,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (MB_LOG_ASSISTANT_TEXT) {
-      // Common patterns:
-      // - response.output_text.delta {delta:"..."}
-      // - response.text.delta {delta:"..."}
-      // - response.output_text.done / response.completed
+      // TEXT STREAM (may be absent in audio-first)
       if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
         logAsstDelta(msg.delta);
       }
@@ -475,8 +517,18 @@ wss.on("connection", (twilioWs) => {
       if (msg.type === "response.output_text.done" || msg.type === "response.text.done") {
         flushAsstLine();
       }
+
+      // AUDIO TRANSCRIPT (this is the important part)
+      if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
+        logAsstAudioTranscriptDelta(msg.delta);
+      }
+      if (msg.type === "response.audio_transcript.done") {
+        flushAsstAudioTranscriptLine();
+      }
+
       if (msg.type === "response.completed") {
         flushAsstLine();
+        flushAsstAudioTranscriptLine();
       }
     }
     // ================================================================
@@ -529,6 +581,8 @@ wss.on("connection", (twilioWs) => {
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
+      twilioStartAt = Date.now();
+
       if (MB_DEBUG) {
         console.log("[WS] start", {
           accountSid: msg.start?.accountSid,
