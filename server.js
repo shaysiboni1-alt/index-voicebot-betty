@@ -14,7 +14,10 @@
 // 3) INFO payload enrichment: info_request_text, info_answer_text, info_topics, notes_internal
 // 4) Twilio recording public link for FINAL/PARTIAL/INFO/ABANDONED via proxy endpoint:
 //    - GET /recordings/:recordingSid.mp3  (streams from Twilio with Basic Auth)
-// 5) Noise solution option: MB_HALF_DUPLEX=true (strict turn-taking: drop user audio while bot speaking)
+// 5) Noise solution option (keep BOTH options in code; behavior controlled by ENV):
+//    - MB_HALF_DUPLEX=true  (strict turn-taking: drop user audio while bot speaking)
+//    - MB_BARGEIN_ENABLED=true (+ knobs) cancels assistant on user speech (barge-in)
+//      NOTE: If MB_HALF_DUPLEX=true, barge-in is disabled (half-duplex wins).
 
 const express = require("express");
 const http = require("http");
@@ -30,31 +33,47 @@ const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
+/* ================== ENV helpers (P0) ================== */
+function envBool(name, defaultValue = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return defaultValue;
+  const normalized = String(raw).trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(normalized)) return true;
+  if (["false", "0", "no", "n"].includes(normalized)) return false;
+  return defaultValue;
+}
+
+function envNum(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return defaultValue;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : defaultValue;
+}
+
 const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
 
-const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
-const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 900);
-const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
+const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
+const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
+const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
 
-const MB_BARGEIN_ENABLED = String(process.env.MB_BARGEIN_ENABLED || "").toLowerCase() === "true";
-const MB_BARGEIN_MIN_MS = Number(process.env.MB_BARGEIN_MIN_MS || 250);
-const MB_BARGEIN_COOLDOWN_MS = Number(process.env.MB_BARGEIN_COOLDOWN_MS || 600);
-const MB_BARGEIN_AUDIO_DROP_MS = Number(process.env.MB_BARGEIN_AUDIO_DROP_MS || 0);
+const MB_BARGEIN_ENABLED = envBool("MB_BARGEIN_ENABLED", false);
+const MB_BARGEIN_MIN_MS = envNum("MB_BARGEIN_MIN_MS", 250);
+const MB_BARGEIN_COOLDOWN_MS = envNum("MB_BARGEIN_COOLDOWN_MS", 600);
+const MB_BARGEIN_AUDIO_DROP_MS = envNum("MB_BARGEIN_AUDIO_DROP_MS", 0);
 
 // Strict turn-taking mode (noise hardening): when true, we drop user audio while assistant is speaking
-const MB_HALF_DUPLEX = String(process.env.MB_HALF_DUPLEX || "").toLowerCase() === "true";
+const MB_HALF_DUPLEX = envBool("MB_HALF_DUPLEX", false);
 
 const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
 const GOOGLE_SA_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
 
-const MB_DEBUG = String(process.env.MB_DEBUG || "").toLowerCase() === "true";
-const MB_LOG_TRANSCRIPTS = String(process.env.MB_LOG_TRANSCRIPTS || "").toLowerCase() === "true";
-const MB_LOG_ASSISTANT_TEXT =
-  String(process.env.MB_LOG_ASSISTANT_TEXT || "").toLowerCase() === "true";
+const MB_DEBUG = envBool("MB_DEBUG", false);
+// If STT enabled, default log transcripts to true unless explicitly disabled
+const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", !!MB_TRANSCRIPTION_MODEL);
+const MB_LOG_ASSISTANT_TEXT = envBool("MB_LOG_ASSISTANT_TEXT", false);
 
-const MB_FINAL_WEBHOOK_ONLY =
-  String(process.env.MB_FINAL_WEBHOOK_ONLY || "").toLowerCase() === "true";
+const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", false);
 
 // Webhook URLs (fixed mapping)
 const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // CALL_LOG
@@ -140,11 +159,29 @@ const memory = createMemoryDb({ url: MEMORY_DB_URL, debug: MB_DEBUG });
 /* ================== SSOT ================== */
 const SSOT_TTL_MS = 60_000;
 
+// P1: required SSOT keys (non-secret)
+const REQUIRED_SETTINGS_KEYS = [
+  "BUSINESS_NAME",
+  "BOT_NAME",
+  "DEFAULT_LANGUAGE",
+  "MAIN_PHONE",
+  "BUSINESS_EMAIL",
+  "BUSINESS_ADDRESS",
+  "WORKING_HOURS",
+  "OPENING_SCRIPT",
+  "OPENING_SCRIPT_RETURNING",
+  "NO_DATA_MESSAGE",
+];
+
+const REQUIRED_PROMPTS = ["MASTER_PROMPT", "GUARDRAILS_PROMPT", "KB_PROMPT", "LEAD_CAPTURE_PROMPT"];
+
 const ssot = {
   enabled: !!(GSHEET_ID && GOOGLE_SA_B64),
   loaded_at: null,
   error: null,
   data: { settings: {}, prompts: {}, intents: [], intent_suggestions: [] },
+  missing_settings_keys: [],
+  missing_prompt_keys: [],
   _expires: 0,
 };
 
@@ -203,9 +240,22 @@ async function loadSSOT(force = false) {
       notes: r[5],
     }));
 
+    const missingSettings = REQUIRED_SETTINGS_KEYS.filter((k) => !settings[k]);
+    const missingPrompts = REQUIRED_PROMPTS.filter((k) => !prompts[k]);
+
     ssot.data = { settings, prompts, intents, intent_suggestions };
     ssot.loaded_at = nowIso();
+    ssot.missing_settings_keys = missingSettings;
+    ssot.missing_prompt_keys = missingPrompts;
+
     ssot.error = null;
+    if (missingSettings.length || missingPrompts.length) {
+      const parts = [];
+      if (missingSettings.length) parts.push(`Missing SETTINGS keys: ${missingSettings.join(", ")}`);
+      if (missingPrompts.length) parts.push(`Missing PROMPTS keys: ${missingPrompts.join(", ")}`);
+      ssot.error = parts.join(" | ");
+    }
+
     ssot._expires = Date.now() + SSOT_TTL_MS;
 
     if (MB_DEBUG) {
@@ -214,6 +264,8 @@ async function loadSSOT(force = false) {
         prompts_keys: Object.keys(prompts).length,
         intents: intents.length,
         intent_suggestions: intent_suggestions.length,
+        missing_settings: missingSettings.length,
+        missing_prompts: missingPrompts.length,
       });
     }
   } catch (e) {
@@ -479,6 +531,8 @@ app.get("/health", async (req, res) => {
       error: ssot.error,
       settings_keys: Object.keys(ssot.data.settings || {}).length,
       prompts_keys: Object.keys(ssot.data.prompts || {}).length,
+      missing_settings_keys: ssot.missing_settings_keys || [],
+      missing_prompt_keys: ssot.missing_prompt_keys || [],
       intents: ssot.data.intents.length,
       intent_suggestions: ssot.data.intent_suggestions.length,
     },
@@ -493,7 +547,19 @@ app.get("/health", async (req, res) => {
       enabled: !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && PUBLIC_BASE_URL),
       public_base_url: baseUrlNoSlash(PUBLIC_BASE_URL) || null,
     },
-    half_duplex: MB_HALF_DUPLEX,
+    noise_options: {
+      half_duplex: MB_HALF_DUPLEX,
+      bargein_enabled: MB_BARGEIN_ENABLED,
+      bargein_min_ms: MB_BARGEIN_MIN_MS,
+      bargein_cooldown_ms: MB_BARGEIN_COOLDOWN_MS,
+      bargein_audio_drop_ms: MB_BARGEIN_AUDIO_DROP_MS,
+    },
+    transcription: {
+      enabled: !!MB_TRANSCRIPTION_MODEL,
+      log_transcripts: MB_LOG_TRANSCRIPTS,
+      model: MB_TRANSCRIPTION_MODEL || null,
+      language: MB_TRANSCRIPTION_LANGUAGE || null,
+    },
   });
 });
 
@@ -505,6 +571,8 @@ app.post("/admin/reload-sheets", async (req, res) => {
   const prompt_ids = Object.keys(ssot.data.prompts || {});
   const intents = ssot.data.intents?.length || 0;
   const intent_suggestions = ssot.data.intent_suggestions?.length || 0;
+  const missing_settings_keys = ssot.missing_settings_keys || [];
+  const missing_prompt_keys = ssot.missing_prompt_keys || [];
 
   if (ssot.error) {
     return res.status(500).json({
@@ -514,6 +582,8 @@ app.post("/admin/reload-sheets", async (req, res) => {
       error: ssot.error,
       settings_keys,
       prompt_ids,
+      missing_settings_keys,
+      missing_prompt_keys,
       intents,
       intent_suggestions,
     });
@@ -525,6 +595,8 @@ app.post("/admin/reload-sheets", async (req, res) => {
     sheets_loaded_at: ssot.loaded_at,
     settings_keys,
     prompt_ids,
+    missing_settings_keys,
+    missing_prompt_keys,
     intents,
     intent_suggestions,
   });
@@ -791,7 +863,10 @@ wss.on("connection", (twilioWs) => {
     }
 
     // recording note (debug-friendly)
-    if (!recordingPublicUrl && (decision === "FINAL" || decision === "PARTIAL" || decision === "INFO" || decision === "ABANDONED")) {
+    if (
+      !recordingPublicUrl &&
+      (decision === "FINAL" || decision === "PARTIAL" || decision === "INFO" || decision === "ABANDONED")
+    ) {
       parts.push("recording_public_url=missing");
     }
 
@@ -1055,7 +1130,13 @@ wss.on("connection", (twilioWs) => {
     // Memory lookup
     let memoryRow = null;
     if (callerE164) {
-      memoryRow = await memory.lookup(callerE164);
+      try {
+        memoryRow = await memory.lookup(callerE164);
+      } catch (e) {
+        memoryRow = null;
+        if (MB_DEBUG) console.log("[MEMORY] lookup failed", { err: e && (e.message || String(e)) });
+      }
+
       if (memoryRow && memoryRow.name) {
         if (MB_DEBUG) console.log("[MEMORY] hit", { caller: callerE164, name: memoryRow.name });
       } else {
@@ -1428,8 +1509,13 @@ wss.on("connection", (twilioWs) => {
     }
   });
 
+  // P0: also decide on WS close (in case stop is missed)
   twilioWs.on("close", () => {
     if (MB_DEBUG) console.log("[WS] closed");
+    if (!callEndedAtIso) {
+      callEndedAtIso = nowIso();
+      decideAndSendOnEnd("twilio_close").catch(() => {});
+    }
     try {
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_close");
     } catch {}
