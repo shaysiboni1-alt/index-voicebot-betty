@@ -1,9 +1,7 @@
 // memoryDb.js
-// Index Betty – Memory DB module (Postgres)
-// Goals:
-// - Safe init + auto-migration
-// - Fix broken schemas: missing column, missing unique constraint for ON CONFLICT
-// - Provide: init(), lookup(), upsertCall(), saveName()
+// Index Betty – Memory DB module
+// Fixes the "caller_key" issue by treating caller_key as the canonical PK.
+// Auto-migrates safely and supports existing/broken schemas.
 
 let Pg;
 try {
@@ -14,10 +12,6 @@ try {
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 function normalizeE164(s) {
@@ -34,12 +28,93 @@ function createMemoryDb({ url, debug }) {
     enabled: false,
     ready: false,
     error: null,
-    pool: null,
     last_ok_at: null,
+    pool: null,
+    schema: {
+      hasCallerKey: false,
+      hasCallerIdE164: false,
+      hasName: false,
+      hasCallCount: false,
+      hasLastCallAt: false,
+    },
   };
 
   function enabled() {
     return !!(url && Pg);
+  }
+
+  async function query(sql, params) {
+    return state.pool.query(sql, params);
+  }
+
+  async function detectColumns() {
+    const res = await query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'caller_memory'
+      `,
+      []
+    );
+    const cols = new Set((res.rows || []).map((r) => r.column_name));
+
+    state.schema.hasCallerKey = cols.has("caller_key");
+    state.schema.hasCallerIdE164 = cols.has("caller_id_e164");
+    state.schema.hasName = cols.has("name");
+    state.schema.hasCallCount = cols.has("call_count");
+    state.schema.hasLastCallAt = cols.has("last_call_at");
+  }
+
+  async function ensureSchema() {
+    // Create the table in the NEW canonical shape:
+    // caller_key is the PK (matches what your DB currently enforces).
+    await query(`
+      CREATE TABLE IF NOT EXISTS caller_memory (
+        caller_key TEXT PRIMARY KEY,
+        caller_id_e164 TEXT,
+        name TEXT,
+        call_count INTEGER DEFAULT 0,
+        last_call_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await detectColumns();
+
+    // Add missing columns safely (works even if the table existed)
+    const alters = [];
+
+    if (!state.schema.hasCallerKey) alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS caller_key TEXT;`);
+    if (!state.schema.hasCallerIdE164)
+      alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS caller_id_e164 TEXT;`);
+    if (!state.schema.hasName) alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS name TEXT;`);
+    if (!state.schema.hasCallCount)
+      alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS call_count INTEGER DEFAULT 0;`);
+    if (!state.schema.hasLastCallAt)
+      alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS last_call_at TIMESTAMPTZ;`);
+
+    alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+    alters.push(`ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
+
+    for (const sql of alters) {
+      await query(sql);
+    }
+
+    // Helpful indexes (safe)
+    await query(`CREATE INDEX IF NOT EXISTS idx_caller_memory_last_call_at ON caller_memory (last_call_at);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_caller_memory_caller_id_e164 ON caller_memory (caller_id_e164);`);
+
+    // If some old rows had caller_id_e164 but caller_key is null, backfill caller_key
+    // (This is the exact error you hit: null value in caller_key violates not-null constraint)
+    await query(`
+      UPDATE caller_memory
+      SET caller_key = COALESCE(caller_key, caller_id_e164),
+          updated_at = NOW()
+      WHERE caller_key IS NULL AND caller_id_e164 IS NOT NULL;
+    `);
+
+    state.last_ok_at = nowIso();
   }
 
   async function init() {
@@ -47,7 +122,7 @@ function createMemoryDb({ url, debug }) {
 
     if (!state.enabled) {
       state.ready = false;
-      if (url && !Pg) state.error = "pg module is not available (missing dependency).";
+      state.error = url && !Pg ? "pg module is not available (missing dependency)." : null;
       return state;
     }
 
@@ -64,51 +139,10 @@ function createMemoryDb({ url, debug }) {
       });
 
       await state.pool.query("SELECT 1");
-
-      // Create table if missing (correct schema)
-      await state.pool.query(`
-        CREATE TABLE IF NOT EXISTS caller_memory (
-          caller_id_e164 TEXT PRIMARY KEY,
-          name TEXT,
-          call_count INTEGER DEFAULT 0,
-          last_call_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ DEFAULT NOW(),
-          updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-      `);
-
-      // Ensure columns exist (older broken schema safety)
-      const alters = [
-        `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS caller_id_e164 TEXT;`,
-        `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS name TEXT;`,
-        `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS call_count INTEGER DEFAULT 0;`,
-        `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS last_call_at TIMESTAMPTZ;`,
-        `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`,
-        `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`,
-      ];
-      for (const sql of alters) {
-        await state.pool.query(sql);
-      }
-
-      // ✅ Fix "ON CONFLICT ... no unique constraint":
-      // Some existing DBs may have the table without PK/unique on caller_id_e164.
-      // We create a UNIQUE index if missing (safe even if PK already exists).
-      await state.pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_caller_memory_caller_id_e164
-        ON caller_memory (caller_id_e164);
-      `);
-
-      await state.pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_caller_memory_last_call_at
-        ON caller_memory (last_call_at);
-      `);
-
-      // Optional: if any rows have NULL caller_id_e164 due to past bad schema, clean them.
-      await state.pool.query(`DELETE FROM caller_memory WHERE caller_id_e164 IS NULL OR caller_id_e164 = '';`);
+      await ensureSchema();
 
       state.ready = true;
       state.error = null;
-      state.last_ok_at = nowIso();
       if (debug) console.log("[MEMORY_DB] ready");
     } catch (e) {
       state.ready = false;
@@ -119,18 +153,29 @@ function createMemoryDb({ url, debug }) {
     return state;
   }
 
+  function canonicalKeyFromCaller(callerE164) {
+    const e164 = normalizeE164(callerE164);
+    if (!e164) return null;
+    return e164; // caller_key == e164
+  }
+
   async function lookup(callerE164) {
     try {
-      const c = normalizeE164(callerE164);
-      if (!c) return null;
-
+      const key = canonicalKeyFromCaller(callerE164);
+      if (!key) return null;
       await init();
       if (!state.ready || !state.pool) return null;
 
-      const res = await state.pool.query(
-        `SELECT caller_id_e164, name, call_count, last_call_at FROM caller_memory WHERE caller_id_e164 = $1 LIMIT 1`,
-        [c]
+      const res = await query(
+        `
+        SELECT caller_key, caller_id_e164, name, call_count, last_call_at
+        FROM caller_memory
+        WHERE caller_key = $1
+        LIMIT 1
+        `,
+        [key]
       );
+
       return res.rows?.[0] || null;
     } catch (e) {
       console.error("[MEMORY] lookup failed", e && (e.message || String(e)));
@@ -140,56 +185,56 @@ function createMemoryDb({ url, debug }) {
 
   async function upsertCall(callerE164) {
     try {
-      const c = normalizeE164(callerE164);
-      if (!c) return;
-
+      const key = canonicalKeyFromCaller(callerE164);
+      if (!key) return;
       await init();
       if (!state.ready || !state.pool) return;
 
-      await state.pool.query(
+      await query(
         `
-        INSERT INTO caller_memory (caller_id_e164, call_count, last_call_at, created_at, updated_at)
-        VALUES ($1, 1, NOW(), NOW(), NOW())
-        ON CONFLICT (caller_id_e164)
+        INSERT INTO caller_memory (caller_key, caller_id_e164, call_count, last_call_at, created_at, updated_at)
+        VALUES ($1, $1, 1, NOW(), NOW(), NOW())
+        ON CONFLICT (caller_key)
         DO UPDATE SET
+          caller_id_e164 = COALESCE(caller_memory.caller_id_e164, EXCLUDED.caller_id_e164),
           call_count = COALESCE(caller_memory.call_count, 0) + 1,
           last_call_at = NOW(),
           updated_at = NOW()
         `,
-        [c]
+        [key]
       );
 
       state.last_ok_at = nowIso();
+      if (debug) console.log("[MEMORY] upsert_call ok", { caller: key });
     } catch (e) {
       console.error("[MEMORY] upsert_call failed", e && (e.message || String(e)));
     }
   }
 
-  async function saveName(callerE164, name, debug) {
+  async function saveName(callerE164, name) {
     try {
-      const c = normalizeE164(callerE164);
-      if (!c) return;
-
+      const key = canonicalKeyFromCaller(callerE164);
       const n = String(name || "").trim();
-      if (!n) return;
+      if (!key || !n) return;
 
       await init();
       if (!state.ready || !state.pool) return;
 
-      await state.pool.query(
+      await query(
         `
-        INSERT INTO caller_memory (caller_id_e164, name, call_count, last_call_at, created_at, updated_at)
-        VALUES ($1, $2, 1, NOW(), NOW(), NOW())
-        ON CONFLICT (caller_id_e164)
+        INSERT INTO caller_memory (caller_key, caller_id_e164, name, call_count, last_call_at, created_at, updated_at)
+        VALUES ($1, $1, $2, 1, NOW(), NOW(), NOW())
+        ON CONFLICT (caller_key)
         DO UPDATE SET
           name = EXCLUDED.name,
+          caller_id_e164 = COALESCE(caller_memory.caller_id_e164, EXCLUDED.caller_id_e164),
           updated_at = NOW()
         `,
-        [c, n]
+        [key, n]
       );
 
       state.last_ok_at = nowIso();
-      if (debug) console.log("[MEMORY] name_saved", { caller: c, name: n });
+      if (debug) console.log("[MEMORY] name_saved ok", { caller: key, name: n });
     } catch (e) {
       console.error("[MEMORY] name_saved failed", e && (e.message || String(e)));
     }
