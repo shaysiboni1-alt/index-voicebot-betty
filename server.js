@@ -13,7 +13,7 @@
 // I) LEAD GATE (deterministic) + Webhooks:
 //    - ABANDONED_WEBHOOK_URL -> CALL_LOG (per your mapping)
 //    - CALL_LOG_WEBHOOK_URL -> ABANDONED (per your mapping)
-//    - FINAL_WEBHOOK_URL -> FINAL + PARTIAL
+//    - FINAL_WEBHOOK_URL -> FINAL + PARTIAL + INFO (INFO may be without name)
 
 const express = require("express");
 const http = require("http");
@@ -56,7 +56,7 @@ const MB_FINAL_WEBHOOK_ONLY =
 // Webhook URLs (use EXACT names you requested)
 const ABANDONED_WEBHOOK_URL = (process.env.ABANDONED_WEBHOOK_URL || "").trim(); // per your mapping: CALL_LOG
 const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // per your mapping: ABANDONED
-const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL
+const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL + INFO
 
 // DB URL (Render: DATABASE_URL)
 const MEMORY_DB_URL = (process.env.MEMORY_DB_URL || process.env.DATABASE_URL || "").trim();
@@ -294,6 +294,13 @@ function isCallbackRequested(text) {
   return /(תחזרו|תחזור|חזרה|שיחזרו|טלפון חוזר|תתקשרו|שיחה חוזרת|שיחזר אליי|לחזור אלי|לחזור אליי)/.test(t);
 }
 
+/* ================== INFO detection helpers (minimal) ================== */
+function isInfoRequest(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return /(שעות|שעות פעילות|עד מתי|מתי פתוח|מתי פתוחים|כתובת|איפה אתם|מיקום|טלפון|מספר טלפון|איך מתקשרים|מייל|אימייל|דוא"ל|email)/i.test(t);
+}
+
 /* ================== Webhook sender + https logs ================== */
 async function postJson(url, payload, meta = {}) {
   if (!url) return { ok: false, status: null };
@@ -448,6 +455,10 @@ wss.on("connection", (twilioWs) => {
   let callbackToNumber = null; // digits or e164
   let closingForced = false;
 
+  // INFO tracking (new)
+  let infoRequested = false;     // user asked office info
+  let infoProvided = false;      // assistant started answering that info
+
   // Lead/webhook bookkeeping
   const callStartedAtIso = nowIso();
   let callEndedAtIso = null;
@@ -457,6 +468,7 @@ wss.on("connection", (twilioWs) => {
   let sentFinal = false;
   let sentAbandoned = false;
   let sentPartial = false;
+  let sentInfo = false;
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -635,6 +647,19 @@ wss.on("connection", (twilioWs) => {
     return true;
   }
 
+  function isPartialLead() {
+    // PARTIAL = יש name אבל חסר message, או שהתבקשה חזרה וחסר callback_to_number.
+    if (!capturedName) return false;
+    if (!capturedMessage) return true;
+    if (callbackRequested && !callbackToNumber) return true;
+    return false;
+  }
+
+  function isInfoCall() {
+    // INFO = אין name, אבל נמסר מידע ענייני/משרדי (שעות/כתובת/טלפון/מייל)
+    return !capturedName && !!infoProvided;
+  }
+
   async function sendCallLogOnce() {
     // Per your mapping: ABANDONED_WEBHOOK_URL == CALL_LOG
     if (sentCallLog) return;
@@ -642,35 +667,83 @@ wss.on("connection", (twilioWs) => {
     if (MB_FINAL_WEBHOOK_ONLY) return;
 
     sentCallLog = true;
-    const payload = { event_type: "CALL_LOG", ...buildBasePayload() };
+    const payload = { event_type: "CALL_LOG", lead_type: "CALL_LOG", ...buildBasePayload() };
     await postJson(ABANDONED_WEBHOOK_URL, payload, { tag: "CALL_LOG" });
   }
 
-  async function sendFinalOrPartialOnce() {
-    if (sentFinal || sentPartial) return;
+  async function sendFinalOnce() {
+    if (sentFinal) return;
     if (!FINAL_WEBHOOK_URL) return;
+    sentFinal = true;
 
-    const complete = isLeadComplete();
-    const payload = {
-      event_type: complete ? "FINAL" : "PARTIAL",
-      lead_type: complete ? "FINAL" : "PARTIAL",
-      ...buildBasePayload(),
-    };
+    const payload = { event_type: "FINAL", lead_type: "FINAL", ...buildBasePayload() };
+    await postJson(FINAL_WEBHOOK_URL, payload, { tag: "FINAL" });
+  }
 
-    if (complete) sentFinal = true;
-    else sentPartial = true;
+  async function sendPartialOnce() {
+    if (sentPartial) return;
+    if (!FINAL_WEBHOOK_URL) return;
+    sentPartial = true;
 
-    await postJson(FINAL_WEBHOOK_URL, payload, { tag: complete ? "FINAL" : "PARTIAL" });
+    const payload = { event_type: "PARTIAL", lead_type: "PARTIAL", ...buildBasePayload() };
+    await postJson(FINAL_WEBHOOK_URL, payload, { tag: "PARTIAL" });
+  }
+
+  async function sendInfoOnce() {
+    if (sentInfo) return;
+    if (!FINAL_WEBHOOK_URL) return;
+    sentInfo = true;
+
+    const payload = { event_type: "INFO", lead_type: "INFO", ...buildBasePayload() };
+    await postJson(FINAL_WEBHOOK_URL, payload, { tag: "INFO" });
   }
 
   async function sendAbandonedOnce() {
     // Per your mapping: CALL_LOG_WEBHOOK_URL == ABANDONED
     if (sentAbandoned) return;
     if (!CALL_LOG_WEBHOOK_URL) return;
-
     sentAbandoned = true;
-    const payload = { event_type: "ABANDONED", ...buildBasePayload() };
+
+    const payload = { event_type: "ABANDONED", lead_type: "ABANDONED", ...buildBasePayload() };
     await postJson(CALL_LOG_WEBHOOK_URL, payload, { tag: "ABANDONED" });
+  }
+
+  async function decideAndSendOnEnd(reason) {
+    // Single decision point (prevents contradictions)
+    if (sentFinal || sentPartial || sentInfo || sentAbandoned) return;
+
+    let decision = "NONE";
+
+    if (isLeadComplete()) {
+      decision = "FINAL";
+      await sendFinalOnce();
+    } else if (isPartialLead()) {
+      decision = "PARTIAL";
+      await sendPartialOnce();
+    } else if (isInfoCall()) {
+      decision = "INFO";
+      await sendInfoOnce();
+    } else if (!capturedName) {
+      decision = "ABANDONED";
+      await sendAbandonedOnce();
+    } else {
+      // fallback safety (should not happen): if name exists but nothing else, it's PARTIAL
+      decision = "PARTIAL_FALLBACK";
+      await sendPartialOnce();
+    }
+
+    if (MB_DEBUG) {
+      console.log("[LEAD_DECISION]", {
+        reason: reason || null,
+        decision,
+        name: !!capturedName,
+        message: !!capturedMessage,
+        callback_requested: !!callbackRequested,
+        callback_to_number: !!callbackToNumber,
+        infoRequested,
+        infoProvided,
+      });
+    }
   }
 
   function captureUserUtteranceFromTranscriptionEvent(msg) {
@@ -689,6 +762,12 @@ wss.on("connection", (twilioWs) => {
     if (!text) return;
 
     if (isCallerWantsToEnd(text)) closingForced = true;
+
+    // INFO request detection (new)
+    if (!infoRequested && isInfoRequest(text)) {
+      infoRequested = true;
+      if (MB_DEBUG) console.log("[INFO] requested=true (from user)");
+    }
 
     if (!callbackRequested && isCallbackRequested(text)) {
       callbackRequested = true;
@@ -927,9 +1006,16 @@ wss.on("connection", (twilioWs) => {
       if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
         logAsstAudioTranscriptDelta(msg.delta);
 
-        // deterministically detect prompts from assistant to set gates
         const d = msg.delta;
 
+        // If user requested info, and assistant started responding -> INFO provided
+        if (infoRequested && !infoProvided) {
+          // mark as soon as assistant begins responding (minimal + safe)
+          infoProvided = true;
+          if (MB_DEBUG) console.log("[INFO] provided=true (assistant started answering)");
+        }
+
+        // deterministically detect prompts from assistant to set gates
         if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
           if (!capturedName) {
             expectingName = true;
@@ -978,13 +1064,7 @@ wss.on("connection", (twilioWs) => {
 
       if (closingForced) {
         callEndedAtIso = nowIso();
-
-        if (capturedName && capturedMessage) {
-          sendFinalOrPartialOnce().catch(() => {});
-        } else {
-          if (!capturedName) sendAbandonedOnce().catch(() => {});
-          else sendFinalOrPartialOnce().catch(() => {});
-        }
+        decideAndSendOnEnd("closing_forced").catch(() => {});
       }
 
       maybeCreateResponse(openaiWs, "speech_stopped");
@@ -1078,17 +1158,7 @@ wss.on("connection", (twilioWs) => {
 
       if (MB_DEBUG) console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
 
-      (async () => {
-        if (!capturedName) {
-          await sendAbandonedOnce();
-          return;
-        }
-        if (!isLeadComplete()) {
-          await sendFinalOrPartialOnce();
-          return;
-        }
-        await sendFinalOrPartialOnce();
-      })().catch(() => {});
+      decideAndSendOnEnd("twilio_stop").catch(() => {});
 
       try {
         if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
