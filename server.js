@@ -6,23 +6,19 @@
 // B) Assistant text logs controlled by ENV  (NOW includes audio_transcript)
 // C) POST /admin/reload-sheets (force SSOT reload) for Apps Script
 // D) SSOT prewarm + cache-first on call open to reduce opening latency (safe fallback to force reload)
-// E) MEMORY DB (Postgres) OPTIONAL + safe (no DB -> no crash)
-// F) Admin auth token (Bearer) for /admin/*
-// G) POST /admin/purge-memory (monthly delete from app)
+// E) MEMORY_DB auto-migration (fix missing columns like last_call_at) + safe prewarm (never breaks voice)
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
 
-// OPTIONAL DB (safe)
-let Pool = null;
+// ✅ pg is required only if DB is enabled. It's still a dependency in package.json.
+let Pg;
 try {
-  ({ Pool } = require("pg"));
-} catch {
-  // If pg not installed, we keep running (but Render will crash only if code path requires it).
-  // We'll still guard all DB usage behind availability checks.
-  Pool = null;
+  Pg = require("pg");
+} catch (e) {
+  Pg = null;
 }
 
 const PORT = process.env.PORT || 10000;
@@ -50,25 +46,8 @@ const MB_LOG_TRANSCRIPTS =
 const MB_LOG_ASSISTANT_TEXT =
   String(process.env.MB_LOG_ASSISTANT_TEXT || "").toLowerCase() === "true";
 
-// ADMIN TOKEN (Bearer)
-const MB_ADMIN_TOKEN = (process.env.MB_ADMIN_TOKEN || "").trim();
-
-// MEMORY DB (Postgres on Render)
-const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
-const MB_MEMORY_ENABLED =
-  String(process.env.MB_MEMORY_ENABLED || "true").toLowerCase() === "true";
-
-// Memory behavior (locked by your choices)
-const MB_MEMORY_USE_REPEAT_GREETING =
-  String(process.env.MB_MEMORY_USE_REPEAT_GREETING || "true").toLowerCase() === "true";
-// Format you approved:
-// "{GREETING}, שי, נעים לשמוע ממך שוב. איך נוכל לעזור?"
-const MB_MEMORY_REPEAT_TEMPLATE =
-  (process.env.MB_MEMORY_REPEAT_TEMPLATE ||
-    "{GREETING}, {NAME}, נעים לשמוע ממך שוב. איך נוכל לעזור?").trim();
-
-// Monthly purge default: 30 days
-const MB_MEMORY_RETENTION_DAYS = Number(process.env.MB_MEMORY_RETENTION_DAYS || 30);
+// MEMORY DB (Render usually provides DATABASE_URL; allow override)
+const MEMORY_DB_URL = (process.env.MEMORY_DB_URL || process.env.DATABASE_URL || "").trim();
 
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
@@ -97,131 +76,107 @@ function getGreetingBucketAndText() {
   return { bucket: "night", text: "לילה טוב" };
 }
 
-/* ================== ADMIN AUTH ================== */
-function requireAdmin(req, res, next) {
-  // If no token set, keep endpoints open (dev convenience) – but recommended to set token in Render.
-  if (!MB_ADMIN_TOKEN) return next();
-  const auth = String(req.headers.authorization || "");
-  if (!auth.startsWith("Bearer ")) return res.status(401).json({ ok: false, error: "missing_bearer" });
-  const token = auth.slice("Bearer ".length).trim();
-  if (token !== MB_ADMIN_TOKEN) return res.status(403).json({ ok: false, error: "forbidden" });
-  return next();
+/* ================== MEMORY DB (safe) ================== */
+const memoryDb = {
+  enabled: false,
+  ready: false,
+  error: null,
+  pool: null,
+  last_ok_at: null,
+};
+
+function memoryDbEnabled() {
+  return !!(MEMORY_DB_URL && Pg);
 }
 
-/* ================== MEMORY DB (OPTIONAL, SAFE) ================== */
-let dbPool = null;
-let dbReady = false;
-let dbError = null;
+async function initMemoryDbIfNeeded() {
+  memoryDb.enabled = memoryDbEnabled();
 
-function normalizeCallerIdToE164(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return null;
-  // Twilio usually provides +972...
-  if (s.startsWith("+") && s.length >= 8) return s;
-  // If already digits, attempt best-effort:
-  const digits = s.replace(/[^\d]/g, "");
-  if (!digits) return null;
-  if (digits.startsWith("972")) return "+" + digits;
-  if (digits.startsWith("0") && digits.length >= 9) return "+972" + digits.slice(1);
-  return "+" + digits;
-}
-
-async function initDbIfNeeded() {
-  if (!MB_MEMORY_ENABLED) return { enabled: false, ready: false, error: null };
-  if (!DATABASE_URL) return { enabled: false, ready: false, error: null };
-  if (!Pool) {
-    dbError = "pg_module_missing";
-    return { enabled: true, ready: false, error: dbError };
+  if (!memoryDb.enabled) {
+    memoryDb.ready = false;
+    if (MEMORY_DB_URL && !Pg) {
+      memoryDb.error = "pg module is not available (missing dependency).";
+    }
+    return memoryDb;
   }
-  if (dbReady && dbPool) return { enabled: true, ready: true, error: null };
+
+  if (memoryDb.pool) return memoryDb;
 
   try {
-    dbPool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : undefined,
-      max: 5,
+    const { Pool } = Pg;
+    memoryDb.pool = new Pool({
+      connectionString: MEMORY_DB_URL,
+      ssl: MEMORY_DB_URL.includes("render.com") ? { rejectUnauthorized: false } : undefined,
+      max: 2,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 10_000,
     });
 
-    // create table (idempotent)
-    await dbPool.query(`
+    // Basic connectivity test
+    await memoryDb.pool.query("SELECT 1");
+
+    // ✅ Auto-migrate: create table + add missing columns (handles your last_call_at issue)
+    await memoryDb.pool.query(`
       CREATE TABLE IF NOT EXISTS caller_memory (
         caller_id_e164 TEXT PRIMARY KEY,
         name TEXT,
-        last_intent TEXT,
+        call_count INTEGER DEFAULT 0,
         last_call_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
-    // index for cleanup
-    await dbPool.query(`
-      CREATE INDEX IF NOT EXISTS idx_caller_memory_last_call_at
-      ON caller_memory (last_call_at);
-    `);
+    // Add missing columns safely for older existing tables
+    const alters = [
+      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS name TEXT;`,
+      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS call_count INTEGER DEFAULT 0;`,
+      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS last_call_at TIMESTAMPTZ;`,
+      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`,
+      `ALTER TABLE caller_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`,
+    ];
 
-    dbReady = true;
-    dbError = null;
+    for (const sql of alters) {
+      await memoryDb.pool.query(sql);
+    }
+
+    // Indexes (safe)
+    await memoryDb.pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_caller_memory_last_call_at ON caller_memory (last_call_at);`
+    );
+
+    memoryDb.ready = true;
+    memoryDb.error = null;
+    memoryDb.last_ok_at = nowIso();
+
     if (MB_DEBUG) console.log("[MEMORY_DB] ready");
-    return { enabled: true, ready: true, error: null };
   } catch (e) {
-    dbReady = false;
-    dbError = e && (e.message || String(e));
-    console.error("[MEMORY_DB] init failed", dbError);
-    return { enabled: true, ready: false, error: dbError };
+    memoryDb.ready = false;
+    memoryDb.error = e && (e.message || String(e));
+    console.error("[MEMORY_DB] init failed", memoryDb.error);
   }
+
+  return memoryDb;
 }
 
-async function getCallerMemory(callerE164) {
+// Prewarm memory DB at startup (never blocks boot)
+(async () => {
+  const t0 = Date.now();
   try {
-    if (!MB_MEMORY_ENABLED || !dbReady || !dbPool || !callerE164) return null;
-    const r = await dbPool.query(
-      `SELECT caller_id_e164, name, last_intent, last_call_at FROM caller_memory WHERE caller_id_e164 = $1 LIMIT 1`,
-      [callerE164]
-    );
-    return r.rows?.[0] || null;
+    await initMemoryDbIfNeeded();
   } catch (e) {
-    if (MB_DEBUG) console.error("[MEMORY_DB] get failed", e && (e.message || e));
-    return null;
+    // already handled
+  } finally {
+    if (MB_DEBUG) {
+      console.log("[MEMORY_DB] prewarm", {
+        enabled: memoryDb.enabled,
+        ready: memoryDb.ready,
+        error: memoryDb.error,
+        ms: Date.now() - t0,
+      });
+    }
   }
-}
-
-async function upsertCallerMemory({ callerE164, name, lastIntent }) {
-  try {
-    if (!MB_MEMORY_ENABLED || !dbReady || !dbPool || !callerE164) return false;
-    await dbPool.query(
-      `
-      INSERT INTO caller_memory (caller_id_e164, name, last_intent, last_call_at, updated_at)
-      VALUES ($1, $2, $3, NOW(), NOW())
-      ON CONFLICT (caller_id_e164)
-      DO UPDATE SET
-        name = COALESCE(EXCLUDED.name, caller_memory.name),
-        last_intent = COALESCE(EXCLUDED.last_intent, caller_memory.last_intent),
-        last_call_at = NOW(),
-        updated_at = NOW()
-      `,
-      [callerE164, name || null, lastIntent || null]
-    );
-    return true;
-  } catch (e) {
-    if (MB_DEBUG) console.error("[MEMORY_DB] upsert failed", e && (e.message || e));
-    return false;
-  }
-}
-
-async function purgeMemoryOlderThan(days) {
-  try {
-    if (!MB_MEMORY_ENABLED || !dbReady || !dbPool) return { ok: false, deleted: 0, error: "memory_disabled_or_db_not_ready" };
-    const d = Number(days || 30);
-    const r = await dbPool.query(
-      `DELETE FROM caller_memory WHERE last_call_at IS NOT NULL AND last_call_at < NOW() - ($1 || ' days')::interval`,
-      [String(d)]
-    );
-    return { ok: true, deleted: r.rowCount || 0, error: null };
-  } catch (e) {
-    return { ok: false, deleted: 0, error: e && (e.message || String(e)) };
-  }
-}
+})();
 
 /* ================== SSOT ================== */
 const SSOT_TTL_MS = 60_000;
@@ -265,18 +220,21 @@ async function loadSSOT(force = false) {
       return res.data.values || [];
     }
 
+    // SETTINGS key/value
     const settingsRows = await read("SETTINGS!A:B");
     const settings = {};
     settingsRows.slice(1).forEach(([k, v]) => {
       if (k) settings[String(k).trim()] = v ?? "";
     });
 
+    // PROMPTS prompt_id/content_he
     const promptRows = await read("PROMPTS!A:B");
     const prompts = {};
     promptRows.slice(1).forEach(([id, content]) => {
       if (id) prompts[String(id).trim()] = content ?? "";
     });
 
+    // INTENTS intent/priority/trigger_type/triggers_he
     const intentRows = await read("INTENTS!A:D");
     const intents = intentRows.slice(1).map((r) => ({
       intent: r[0],
@@ -285,6 +243,7 @@ async function loadSSOT(force = false) {
       triggers_he: r[3],
     }));
 
+    // INTENT_SUGGESTIONS phrase_he/detected_intent/occurrences/last_seen_at/approved/notes
     const suggRows = await read("INTENT_SUGGESTIONS!A:F");
     const intent_suggestions = suggRows.slice(1).map((r) => ({
       phrase_he: r[0],
@@ -318,25 +277,13 @@ async function loadSSOT(force = false) {
 
 // PREWARM SSOT at server startup (non-blocking)
 (async () => {
-  try {
-    if (ssot.enabled) {
-      const t0 = Date.now();
-      await loadSSOT(false);
-      if (MB_DEBUG) console.log("[SSOT] prewarm done in", Date.now() - t0, "ms");
-    }
-  } catch (e) {
-    console.error("[SSOT] prewarm failed", e && (e.message || e));
-  }
-})();
-
-// PREWARM DB at server startup (non-blocking)
-(async () => {
+  if (!ssot.enabled) return;
   try {
     const t0 = Date.now();
-    const r = await initDbIfNeeded();
-    if (MB_DEBUG) console.log("[MEMORY_DB] prewarm", { ...r, ms: Date.now() - t0 });
+    await loadSSOT(false);
+    if (MB_DEBUG) console.log("[SSOT] prewarm done in", Date.now() - t0, "ms");
   } catch (e) {
-    // already logged
+    console.error("[SSOT] prewarm failed", e && (e.message || e));
   }
 })();
 
@@ -359,7 +306,7 @@ app.use(express.json());
 
 app.get("/health", async (req, res) => {
   await loadSSOT(false);
-  const db = await initDbIfNeeded();
+  await initMemoryDbIfNeeded();
 
   res.json({
     ok: true,
@@ -375,13 +322,18 @@ app.get("/health", async (req, res) => {
       intents: ssot.data.intents.length,
       intent_suggestions: ssot.data.intent_suggestions.length,
     },
-    memory_db: db,
+    memory_db: {
+      enabled: memoryDb.enabled,
+      ready: memoryDb.ready,
+      error: memoryDb.error,
+      last_ok_at: memoryDb.last_ok_at,
+    },
     model: OPENAI_REALTIME_MODEL,
   });
 });
 
-// ✅ REQUIRED endpoint for Apps Script (protected if token set)
-app.post("/admin/reload-sheets", requireAdmin, async (req, res) => {
+// ✅ REQUIRED endpoint for Apps Script
+app.post("/admin/reload-sheets", async (req, res) => {
   const started = nowIso();
   await loadSSOT(true);
 
@@ -414,20 +366,6 @@ app.post("/admin/reload-sheets", requireAdmin, async (req, res) => {
   });
 });
 
-// ✅ Monthly purge from app (protected if token set)
-app.post("/admin/purge-memory", requireAdmin, async (req, res) => {
-  await initDbIfNeeded();
-  const days = Number(req.body?.days || MB_MEMORY_RETENTION_DAYS || 30);
-  const r = await purgeMemoryOlderThan(days);
-  return res.status(r.ok ? 200 : 500).json({
-    ok: r.ok,
-    deleted: r.deleted,
-    retention_days: days,
-    error: r.error,
-    ts: nowIso(),
-  });
-});
-
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
@@ -437,15 +375,6 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
   let callSid = null;
-
-  // caller info for memory
-  let callerRaw = null;
-  let callerE164 = null;
-  let rememberedName = null;
-
-  // capture name from early STT (minimal, safe)
-  let awaitingName = true; // opening asks for name
-  let capturedName = null;
 
   // for latency measurement
   const connT0 = Date.now();
@@ -529,6 +458,7 @@ wss.on("connection", (twilioWs) => {
 
   function maybeCreateResponse(openaiWs, reason) {
     const now = Date.now();
+
     if (responseInFlight) return;
 
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
@@ -536,7 +466,7 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // KEEP exactly your baseline values
+    // KEEP baseline values
     const DEBOUNCE_MS = 350;
     const MIN_FRAMES = 4;
 
@@ -550,58 +480,6 @@ wss.on("connection", (twilioWs) => {
     pendingCreate = false;
     responseInFlight = true;
     if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
-  }
-
-  function looksLikeName(utterance) {
-    const t = String(utterance || "").trim();
-    if (!t) return null;
-    // remove common fluff
-    let s = t
-      .replace(/[.,!?]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    // If user says "קוראים לי X" / "אני X"
-    s = s
-      .replace(/^קוראים לי\s+/i, "")
-      .replace(/^אני\s+/i, "")
-      .replace(/^זה\s+/i, "")
-      .replace(/^השם שלי\s+/i, "")
-      .trim();
-
-    // reject digits
-    if (/\d/.test(s)) return null;
-
-    // take first 1-2 words
-    const parts = s.split(" ").filter(Boolean);
-    if (parts.length === 0) return null;
-    const cand = parts.slice(0, 2).join(" ").trim();
-
-    // length sanity
-    if (cand.length < 2 || cand.length > 40) return null;
-
-    // must be letters (he/en) + spaces + hyphen
-    if (!/^[A-Za-z\u0590-\u05FF\s\-׳"״]+$/.test(cand)) return null;
-
-    return cand;
-  }
-
-  async function handleUserUtteranceForMemory(text) {
-    if (!awaitingName) return;
-    if (capturedName) return;
-
-    const name = looksLikeName(text);
-    if (!name) return;
-
-    capturedName = name;
-    awaitingName = false;
-
-    if (MB_DEBUG) console.log("[MEMORY] captured name", { callerE164, name });
-
-    await initDbIfNeeded();
-    if (callerE164) {
-      await upsertCallerMemory({ callerE164, name, lastIntent: null });
-    }
   }
 
   const openaiWs = new WebSocket(
@@ -621,7 +499,6 @@ wss.on("connection", (twilioWs) => {
     // Cache-first SSOT for low latency
     await loadSSOT(false);
 
-    // SAFE fallback: if cache is empty or error, force reload
     const cachedSettingsKeys = Object.keys(ssot.data.settings || {}).length;
     const cachedPromptsKeys = Object.keys(ssot.data.prompts || {}).length;
     if (ssot.error || cachedSettingsKeys === 0 || cachedPromptsKeys === 0) {
@@ -630,31 +507,15 @@ wss.on("connection", (twilioWs) => {
     }
 
     const { settings, prompts } = ssot.data;
+
     const g = getGreetingBucketAndText();
 
-    // MEMORY: load caller name if exists
-    await initDbIfNeeded();
-    if (callerE164) {
-      const mem = await getCallerMemory(callerE164);
-      rememberedName = mem?.name || null;
-      if (MB_DEBUG && rememberedName) console.log("[MEMORY] recognized caller", { callerE164, name: rememberedName });
-    }
-
-    // OPENING: from SETTINGS, but if rememberedName -> use repeat template you approved
-    let opening = "";
-    if (MB_MEMORY_ENABLED && rememberedName && MB_MEMORY_USE_REPEAT_GREETING) {
-      opening = injectVars(MB_MEMORY_REPEAT_TEMPLATE, {
-        GREETING: g.text,
-        NAME: rememberedName,
-      });
-    } else {
-      const openingTemplate = settings.OPENING_SCRIPT || "";
-      opening = injectVars(openingTemplate, {
-        GREETING: g.text,
-        BOT_NAME: settings.BOT_NAME,
-        BUSINESS_NAME: settings.BUSINESS_NAME,
-      });
-    }
+    const openingTemplate = settings.OPENING_SCRIPT || "";
+    const opening = injectVars(openingTemplate, {
+      GREETING: g.text,
+      BOT_NAME: settings.BOT_NAME,
+      BUSINESS_NAME: settings.BUSINESS_NAME,
+    });
 
     const settingsContext = buildSettingsContext(settings);
 
@@ -668,8 +529,6 @@ wss.on("connection", (twilioWs) => {
       "אסור להשתמש בשום מידע שלא מופיע ב-SETTINGS_CONTEXT.",
       "אם נשאלת שאלה שאין לה ערך מפורש ב-SETTINGS_CONTEXT - השתמשי ב-NO_DATA_MESSAGE מתוך SETTINGS ואז חזרי לשיחה.",
       "OPENING_SCRIPT ו-CLOSING_SCRIPT: כאשר משתמשים בהם - יש לומר מילה במילה ללא שינוי.",
-      "שם פרטי בלבד מספיק; אין להתעקש על שם משפחה.",
-      "דברי בלשון רבים כברירת מחדל, אלא אם המתקשר מבקש אחרת.",
     ].join(" ");
 
     const instructions = [
@@ -696,7 +555,6 @@ wss.on("connection", (twilioWs) => {
       max_response_output_tokens: "inf",
     };
 
-    // Correct Realtime STT field name
     if (MB_TRANSCRIPTION_MODEL) {
       session.input_audio_transcription = {
         model: MB_TRANSCRIPTION_MODEL,
@@ -707,7 +565,6 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    // VERBATIM opening: force speak exactly opening
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -732,7 +589,7 @@ wss.on("connection", (twilioWs) => {
     if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
 
-  openaiWs.on("message", async (raw) => {
+  openaiWs.on("message", (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -740,19 +597,17 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // ======== LOGGING (defensive) + MEMORY name capture ========
+    // LOGGING
     if (MB_LOG_TRANSCRIPTS) {
       if (msg && typeof msg.type === "string" && msg.type.toLowerCase().includes("transcription")) {
         if (typeof msg.delta === "string") sttBuf += msg.delta;
 
         if (typeof msg.text === "string") {
           logSTTLine(msg.text);
-          await handleUserUtteranceForMemory(msg.text);
           sttBuf = "";
         }
         if (typeof msg.transcript === "string") {
           logSTTLine(msg.transcript);
-          await handleUserUtteranceForMemory(msg.transcript);
           sttBuf = "";
         }
 
@@ -761,25 +616,13 @@ wss.on("connection", (twilioWs) => {
           msg.type.toLowerCase().includes("completed") ||
           msg.type.toLowerCase().includes("result")
         ) {
-          if (sttBuf.trim()) {
-            logSTTLine(sttBuf);
-            await handleUserUtteranceForMemory(sttBuf);
-          }
+          if (sttBuf.trim()) logSTTLine(sttBuf);
           sttBuf = "";
         }
       }
     }
-    // If transcripts logging is OFF, we still want memory capture when possible.
-    // So we also listen to transcription events and try to capture without printing.
-    if (!MB_LOG_TRANSCRIPTS) {
-      if (msg && typeof msg.type === "string" && msg.type.toLowerCase().includes("transcription")) {
-        const t = typeof msg.text === "string" ? msg.text : (typeof msg.transcript === "string" ? msg.transcript : null);
-        if (t) await handleUserUtteranceForMemory(t);
-      }
-    }
 
     if (MB_LOG_ASSISTANT_TEXT) {
-      // TEXT STREAM
       if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
         logAsstDelta(msg.delta);
       }
@@ -790,7 +633,6 @@ wss.on("connection", (twilioWs) => {
         flushAsstLine();
       }
 
-      // AUDIO TRANSCRIPT
       if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
         logAsstAudioTranscriptDelta(msg.delta);
       }
@@ -803,14 +645,12 @@ wss.on("connection", (twilioWs) => {
         flushAsstAudioTranscriptLine();
       }
     }
-    // ================================================================
 
     if (msg.type === "input_audio_buffer.speech_stopped") {
       maybeCreateResponse(openaiWs, "speech_stopped");
       return;
     }
 
-    // When model finished speaking, allow next user turn
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
       return;
@@ -855,11 +695,6 @@ wss.on("connection", (twilioWs) => {
       callSid = msg.start?.callSid || null;
       twilioStartAt = Date.now();
 
-      // Caller for memory (from Twilio customParameters)
-      const cp = msg.start?.customParameters || {};
-      callerRaw = cp.caller || cp.From || null;
-      callerE164 = normalizeCallerIdToE164(callerRaw);
-
       if (MB_DEBUG) {
         console.log("[WS] start", {
           accountSid: msg.start?.accountSid,
@@ -867,7 +702,7 @@ wss.on("connection", (twilioWs) => {
           callSid,
           tracks: msg.start?.tracks,
           mediaFormat: msg.start?.mediaFormat,
-          customParameters: cp,
+          customParameters: msg.start?.customParameters || {},
         });
       }
       return;
