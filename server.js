@@ -1,10 +1,10 @@
 // server.js
-// Index Betty – Realtime VoiceBot (OpenAI + SSOT)
-// ADDITIONS ONLY:
-// 1) STT transcript logging
-// 2) Assistant text logging
-// 3) Slight latency improvement
-// 4) +20% audio volume (safe, optional)
+// Index Betty – Realtime VoiceBot (OpenAI baseline + SSOT)
+// Baseline preserved (audio queue, VAD, debounce gates).
+// Adds ONLY:
+// A) STT transcript logs (from Realtime events) controlled by ENV
+// B) Assistant text logs controlled by ENV
+// C) POST /admin/reload-sheets (force SSOT reload) for Apps Script
 
 const express = require("express");
 const http = require("http");
@@ -19,20 +19,22 @@ const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "alloy";
 
-const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim();
+const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
 
 const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
 const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 900);
 const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
 
-// LOGGING FLAGS
-const MB_DEBUG = process.env.MB_DEBUG === "true";
-const MB_LOG_TRANSCRIPTS = process.env.MB_LOG_TRANSCRIPTS === "true";
-const MB_LOG_ASSISTANT_TEXT = process.env.MB_LOG_ASSISTANT_TEXT === "true";
+const GSHEET_ID = (process.env.GSHEET_ID || "").trim();
+const GOOGLE_SA_B64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim();
 
-const GSHEET_ID = process.env.GSHEET_ID || "";
-const GOOGLE_SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
+// LOG FLAGS (as you showed in Render)
+const MB_DEBUG = String(process.env.MB_DEBUG || "").toLowerCase() === "true";
+const MB_LOG_TRANSCRIPTS =
+  String(process.env.MB_LOG_TRANSCRIPTS || "").toLowerCase() === "true";
+const MB_LOG_ASSISTANT_TEXT =
+  String(process.env.MB_LOG_ASSISTANT_TEXT || "").toLowerCase() === "true";
 
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
@@ -61,7 +63,7 @@ function getGreetingBucketAndText() {
   return { bucket: "night", text: "לילה טוב" };
 }
 
-/* ================== SSOT (unchanged) ================== */
+/* ================== SSOT ================== */
 const SSOT_TTL_MS = 60_000;
 
 const ssot = {
@@ -79,53 +81,80 @@ const ssot = {
 
 async function loadSSOT(force = false) {
   if (!ssot.enabled) return ssot;
+
   const now = Date.now();
   if (!force && now < ssot._expires && ssot.loaded_at) return ssot;
 
-  const creds = JSON.parse(Buffer.from(GOOGLE_SA_B64, "base64").toString("utf8"));
-  const auth = new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
-    ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-  );
-  const sheets = google.sheets({ version: "v4", auth });
+  try {
+    const creds = JSON.parse(Buffer.from(GOOGLE_SA_B64, "base64").toString("utf8"));
 
-  async function read(range) {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: GSHEET_ID,
-      range,
+    const auth = new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    );
+
+    const sheets = google.sheets({ version: "v4", auth });
+
+    async function read(range) {
+      const res = await sheets.spreadsheets.values.get({
+        spreadsheetId: GSHEET_ID,
+        range,
+      });
+      return res.data.values || [];
+    }
+
+    // SETTINGS key/value
+    const settingsRows = await read("SETTINGS!A:B");
+    const settings = {};
+    settingsRows.slice(1).forEach(([k, v]) => {
+      if (k) settings[String(k).trim()] = v ?? "";
     });
-    return res.data.values || [];
-  }
 
-  const settings = {};
-  (await read("SETTINGS!A:B")).slice(1).forEach(([k, v]) => {
-    if (k) settings[k] = v ?? "";
-  });
-
-  const prompts = {};
-  (await read("PROMPTS!A:B")).slice(1).forEach(([k, v]) => {
-    if (k) prompts[k] = v ?? "";
-  });
-
-  const intents = (await read("INTENTS!A:D")).slice(1).map((r) => ({
-    intent: r[0],
-    priority: Number(r[1] || 0),
-    trigger_type: r[2],
-    triggers_he: r[3],
-  }));
-
-  ssot.data = { settings, prompts, intents, intent_suggestions: [] };
-  ssot.loaded_at = nowIso();
-  ssot._expires = now + SSOT_TTL_MS;
-
-  if (MB_DEBUG) {
-    console.log("[SSOT] loaded", {
-      settings: Object.keys(settings).length,
-      prompts: Object.keys(prompts).length,
-      intents: intents.length,
+    // PROMPTS prompt_id/content_he
+    const promptRows = await read("PROMPTS!A:B");
+    const prompts = {};
+    promptRows.slice(1).forEach(([id, content]) => {
+      if (id) prompts[String(id).trim()] = content ?? "";
     });
+
+    // INTENTS intent/priority/trigger_type/triggers_he
+    const intentRows = await read("INTENTS!A:D");
+    const intents = intentRows.slice(1).map((r) => ({
+      intent: r[0],
+      priority: Number(r[1] || 0),
+      trigger_type: r[2],
+      triggers_he: r[3],
+    }));
+
+    // INTENT_SUGGESTIONS phrase_he/detected_intent/occurrences/last_seen_at/approved/notes
+    const suggRows = await read("INTENT_SUGGESTIONS!A:F");
+    const intent_suggestions = suggRows.slice(1).map((r) => ({
+      phrase_he: r[0],
+      detected_intent: r[1],
+      occurrences: r[2],
+      last_seen_at: r[3],
+      approved: r[4],
+      notes: r[5],
+    }));
+
+    ssot.data = { settings, prompts, intents, intent_suggestions };
+    ssot.loaded_at = nowIso();
+    ssot.error = null;
+    ssot._expires = Date.now() + SSOT_TTL_MS;
+
+    if (MB_DEBUG) {
+      console.log("[SSOT] loaded", {
+        settings_keys: Object.keys(settings).length,
+        prompts_keys: Object.keys(prompts).length,
+        intents: intents.length,
+        intent_suggestions: intent_suggestions.length,
+      });
+    }
+  } catch (e) {
+    ssot.error = e && (e.message || String(e));
+    console.error("[SSOT] load failed", ssot.error);
   }
 
   return ssot;
@@ -133,20 +162,72 @@ async function loadSSOT(force = false) {
 
 function injectVars(text, vars) {
   let out = String(text || "");
-  Object.entries(vars || {}).forEach(([k, v]) => {
+  for (const [k, v] of Object.entries(vars || {})) {
     out = out.replaceAll(`{${k}}`, String(v ?? ""));
-  });
+  }
   return out;
+}
+
+function buildSettingsContext(settings) {
+  const lines = Object.entries(settings || {}).map(([k, v]) => `${k}=${String(v ?? "")}`);
+  return lines.join("\n");
 }
 
 /* ================== APP ================== */
 const app = express();
+app.use(express.json());
+
 app.get("/health", async (req, res) => {
   await loadSSOT();
   res.json({
     ok: true,
     service: "index-betty-voicebot",
     ts: nowIso(),
+    provider_mode: "openai",
+    ssot: {
+      enabled: ssot.enabled,
+      loaded_at: ssot.loaded_at,
+      error: ssot.error,
+      settings_keys: Object.keys(ssot.data.settings || {}).length,
+      prompts_keys: Object.keys(ssot.data.prompts || {}).length,
+      intents: ssot.data.intents.length,
+      intent_suggestions: ssot.data.intent_suggestions.length,
+    },
+    model: OPENAI_REALTIME_MODEL,
+  });
+});
+
+// ✅ REQUIRED endpoint for Apps Script
+app.post("/admin/reload-sheets", async (req, res) => {
+  const started = nowIso();
+  await loadSSOT(true);
+
+  const settings_keys = Object.keys(ssot.data.settings || {}).length;
+  const prompt_ids = Object.keys(ssot.data.prompts || {});
+  const intents = ssot.data.intents?.length || 0;
+  const intent_suggestions = ssot.data.intent_suggestions?.length || 0;
+
+  if (ssot.error) {
+    return res.status(500).json({
+      ok: false,
+      reloaded_at: started,
+      sheets_loaded_at: ssot.loaded_at,
+      error: ssot.error,
+      settings_keys,
+      prompt_ids,
+      intents,
+      intent_suggestions,
+    });
+  }
+
+  return res.json({
+    ok: true,
+    reloaded_at: started,
+    sheets_loaded_at: ssot.loaded_at,
+    settings_keys,
+    prompt_ids,
+    intents,
+    intent_suggestions,
   });
 });
 
@@ -154,18 +235,101 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 /* ================== WS ================== */
-wss.on("connection", async (twilioWs) => {
-  await loadSSOT(true);
+wss.on("connection", (twilioWs) => {
+  if (MB_DEBUG) console.log("[WS] connection established");
 
   let streamSid = null;
-  let openaiReady = false;
-  let sessionConfigured = false;
-  let responseInFlight = false;
+  let callSid = null;
+
+  // OpenAI session readiness gates
+  let openaiReady = false;       // WS open
+  let sessionConfigured = false; // after we send session.update
+  let pendingCreate = false;     // if we got speech_stopped before ready
+  let responseInFlight = false;  // prevent duplicate response.create
   let lastResponseCreateAt = 0;
   let userFramesSinceLastCreate = 0;
 
+  // Queue Twilio audio until OpenAI WS is ready
+  const audioQueue = [];
+  const MAX_QUEUE_FRAMES = 400;
+
+  // Transcript aggregation (defensive: event names may differ)
+  let sttBuf = "";
+  let asstBuf = "";
+
+  function logSTTLine(line) {
+    if (!MB_LOG_TRANSCRIPTS) return;
+    const t = String(line || "").trim();
+    if (!t) return;
+    console.log(`[STT] ${t}`);
+  }
+
+  function logAsstDelta(delta) {
+    if (!MB_LOG_ASSISTANT_TEXT) return;
+    const d = String(delta || "");
+    if (!d) return;
+    asstBuf += d;
+    // print streaming deltas on same line:
+    process.stdout.write(d);
+  }
+
+  function flushAsstLine() {
+    if (!MB_LOG_ASSISTANT_TEXT) return;
+    const t = String(asstBuf || "").trim();
+    if (t) process.stdout.write("\n");
+    asstBuf = "";
+  }
+
+  function safeSend(ws, obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      ws.send(JSON.stringify(obj));
+      return true;
+    } catch (e) {
+      console.error("[OPENAI] send failed", e && (e.message || e));
+      return false;
+    }
+  }
+
+  function flushAudioQueue(openaiWs) {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    if (!openaiReady || !sessionConfigured) return;
+
+    while (audioQueue.length) {
+      const payload = audioQueue.shift();
+      userFramesSinceLastCreate += 1;
+      safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
+    }
+  }
+
+  function maybeCreateResponse(openaiWs, reason) {
+    const now = Date.now();
+
+    if (responseInFlight) return;
+
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+      pendingCreate = true;
+      return;
+    }
+
+    // KEEP exactly your baseline values
+    const DEBOUNCE_MS = 350;
+    const MIN_FRAMES = 4;
+
+    if (now - lastResponseCreateAt < DEBOUNCE_MS) return;
+    if (userFramesSinceLastCreate < MIN_FRAMES) return;
+
+    lastResponseCreateAt = now;
+    userFramesSinceLastCreate = 0;
+
+    safeSend(openaiWs, { type: "response.create" });
+    pendingCreate = false;
+    responseInFlight = true;
+    if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
+  }
+
   const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -174,82 +338,88 @@ wss.on("connection", async (twilioWs) => {
     }
   );
 
-  function maybeCreateResponse() {
-    const now = Date.now();
-    if (responseInFlight) return;
-    if (now - lastResponseCreateAt < 250) return; // LATENCY TUNE
-    if (userFramesSinceLastCreate < 3) return;    // LATENCY TUNE
-
-    lastResponseCreateAt = now;
-    userFramesSinceLastCreate = 0;
-    responseInFlight = true;
-
-    openaiWs.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          audio: { volume: 1.2 }, // +20% volume (safe)
-        },
-      })
-    );
-  }
-
-  openaiWs.on("open", () => {
+  openaiWs.on("open", async () => {
+    if (MB_DEBUG) console.log("[OPENAI] ws open");
     openaiReady = true;
 
-    const { settings, prompts } = ssot.data;
-    const greeting = getGreetingBucketAndText();
+    // Force SSOT refresh at session start
+    await loadSSOT(true);
 
-    const opening = injectVars(settings.OPENING_SCRIPT, {
-      GREETING: greeting.text,
+    const { settings, prompts } = ssot.data;
+
+    const g = getGreetingBucketAndText();
+
+    // OPENING_SCRIPT must come from SETTINGS only
+    const openingTemplate = settings.OPENING_SCRIPT || "";
+    const opening = injectVars(openingTemplate, {
+      GREETING: g.text,
       BOT_NAME: settings.BOT_NAME,
       BUSINESS_NAME: settings.BUSINESS_NAME,
     });
 
-    openaiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          modalities: ["audio", "text"],
-          voice: OPENAI_VOICE,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          instructions: [
-            injectVars(prompts.MASTER_PROMPT, settings),
-            injectVars(prompts.GUARDRAILS_PROMPT, settings),
-            injectVars(prompts.KB_PROMPT, settings),
-            injectVars(prompts.LEAD_CAPTURE_PROMPT, settings),
-          ].join("\n\n"),
-          turn_detection: {
-            type: "server_vad",
-            threshold: MB_VAD_THRESHOLD,
-            silence_duration_ms: MB_VAD_SILENCE_MS,
-            prefix_padding_ms: MB_VAD_PREFIX_MS,
-          },
-          ...(MB_TRANSCRIPTION_MODEL && {
-            input_audio_transcription: {
-              model: MB_TRANSCRIPTION_MODEL,
-              language: MB_TRANSCRIPTION_LANGUAGE,
-            },
-          }),
-        },
-      })
-    );
+    const settingsContext = buildSettingsContext(settings);
 
+    const master = injectVars(prompts.MASTER_PROMPT || "", settings);
+    const guard = injectVars(prompts.GUARDRAILS_PROMPT || "", settings);
+    const kb = injectVars(prompts.KB_PROMPT || "", settings);
+    const leadCapture = injectVars(prompts.LEAD_CAPTURE_PROMPT || "", settings);
+
+    const hardNoHallucinationLayer = [
+      "חוק על: SETTINGS_CONTEXT הוא מקור האמת היחיד לפרטי המשרד והערכים העסקיים.",
+      "אסור להשתמש בשום מידע שלא מופיע ב-SETTINGS_CONTEXT.",
+      "אם נשאלת שאלה שאין לה ערך מפורש ב-SETTINGS_CONTEXT - השתמשי ב-NO_DATA_MESSAGE מתוך SETTINGS ואז חזרי לשיחה.",
+      "OPENING_SCRIPT ו-CLOSING_SCRIPT: כאשר משתמשים בהם - יש לומר מילה במילה ללא שינוי.",
+    ].join(" ");
+
+    const instructions = [
+      master,
+      guard,
+      kb,
+      leadCapture,
+      hardNoHallucinationLayer,
+      "SETTINGS_CONTEXT (Key=Value):\n" + settingsContext,
+    ].join("\n\n");
+
+    const session = {
+      modalities: ["audio", "text"],
+      voice: OPENAI_VOICE,
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      instructions,
+      turn_detection: {
+        type: "server_vad",
+        threshold: MB_VAD_THRESHOLD,
+        silence_duration_ms: MB_VAD_SILENCE_MS,
+        prefix_padding_ms: MB_VAD_PREFIX_MS,
+      },
+      max_response_output_tokens: "inf",
+    };
+
+    // Correct Realtime STT field name
+    if (MB_TRANSCRIPTION_MODEL) {
+      session.input_audio_transcription = {
+        model: MB_TRANSCRIPTION_MODEL,
+        language: MB_TRANSCRIPTION_LANGUAGE,
+      };
+    }
+
+    safeSend(openaiWs, { type: "session.update", session });
     sessionConfigured = true;
 
-    openaiWs.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          instructions:
-            "אמרי מילה במילה ללא שינוי:\n" + opening,
-          audio: { volume: 1.2 },
-        },
-      })
-    );
+    // VERBATIM opening: force speak exactly opening
+    safeSend(openaiWs, {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions:
+          "דברי עכשיו את הטקסט הבא מילה במילה, ללא שינוי כלל, בלי להוסיף כלום לפני או אחרי:\n" +
+          opening,
+      },
+    });
 
     responseInFlight = true;
+    flushAudioQueue(openaiWs);
+    if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
 
   openaiWs.on("message", (raw) => {
@@ -260,34 +430,92 @@ wss.on("connection", async (twilioWs) => {
       return;
     }
 
-    // LOGGING ADDITION — STT
-    if (MB_LOG_TRANSCRIPTS && msg.type === "input_audio_transcription.result") {
-      console.log("[STT]", msg.text);
+    // ======== LOGGING (defensive, supports multiple event names) ========
+    if (MB_LOG_TRANSCRIPTS) {
+      // Common patterns:
+      // - msg.type includes "transcription" and has msg.text
+      // - msg.type includes "transcription" and has msg.delta
+      // - msg.type includes "transcription" and has msg.transcript
+      if (msg && typeof msg.type === "string" && msg.type.toLowerCase().includes("transcription")) {
+        if (typeof msg.delta === "string") {
+          sttBuf += msg.delta;
+        }
+        if (typeof msg.text === "string") {
+          // sometimes full text arrives as msg.text
+          logSTTLine(msg.text);
+          sttBuf = "";
+        }
+        if (typeof msg.transcript === "string") {
+          logSTTLine(msg.transcript);
+          sttBuf = "";
+        }
+        // finalize buffers on likely "done"/"completed"/"result"
+        if (
+          msg.type.toLowerCase().includes("done") ||
+          msg.type.toLowerCase().includes("completed") ||
+          msg.type.toLowerCase().includes("result")
+        ) {
+          if (sttBuf.trim()) logSTTLine(sttBuf);
+          sttBuf = "";
+        }
+      }
     }
 
-    // LOGGING ADDITION — Assistant text
-    if (MB_LOG_ASSISTANT_TEXT && msg.type === "response.output_text.delta") {
-      process.stdout.write(msg.delta);
+    if (MB_LOG_ASSISTANT_TEXT) {
+      // Common patterns:
+      // - response.output_text.delta {delta:"..."}
+      // - response.text.delta {delta:"..."}
+      // - response.output_text.done / response.completed
+      if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
+        logAsstDelta(msg.delta);
+      }
+      if (msg.type === "response.text.delta" && typeof msg.delta === "string") {
+        logAsstDelta(msg.delta);
+      }
+      if (msg.type === "response.output_text.done" || msg.type === "response.text.done") {
+        flushAsstLine();
+      }
+      if (msg.type === "response.completed") {
+        flushAsstLine();
+      }
     }
-
-    if (msg.type === "response.completed") {
-      responseInFlight = false;
-      if (MB_LOG_ASSISTANT_TEXT) process.stdout.write("\n");
-    }
+    // ================================================================
 
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      maybeCreateResponse();
+      maybeCreateResponse(openaiWs, "speech_stopped");
+      return;
     }
 
-    if (msg.type === "response.audio.delta" && streamSid) {
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: msg.delta },
-        })
-      );
+    // When model finished speaking, allow next user turn
+    if (msg.type === "response.audio.done" || msg.type === "response.completed") {
+      responseInFlight = false;
+      return;
     }
+
+    // AUDIO OUT (DO NOT TOUCH)
+    if (msg.type === "response.audio.delta" && streamSid) {
+      try {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: msg.delta },
+          })
+        );
+      } catch (e) {
+        console.error("[TWILIO] send media failed", e && (e.message || e));
+      }
+    }
+  });
+
+  openaiWs.on("error", (e) => {
+    responseInFlight = false;
+    console.error("[OPENAI] ws error", e && (e.message || e));
+  });
+
+  openaiWs.on("close", (code, reason) => {
+    responseInFlight = false;
+    if (MB_DEBUG) console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
   twilioWs.on("message", (raw) => {
@@ -299,24 +527,64 @@ wss.on("connection", async (twilioWs) => {
     }
 
     if (msg.event === "start") {
-      streamSid = msg.start?.streamSid;
+      streamSid = msg.start?.streamSid || null;
+      callSid = msg.start?.callSid || null;
+      if (MB_DEBUG) {
+        console.log("[WS] start", {
+          accountSid: msg.start?.accountSid,
+          streamSid,
+          callSid,
+          tracks: msg.start?.tracks,
+          mediaFormat: msg.start?.mediaFormat,
+          customParameters: msg.start?.customParameters || {},
+        });
+      }
       return;
     }
 
     if (msg.event === "media") {
-      userFramesSinceLastCreate++;
-      if (openaiReady && sessionConfigured) {
-        openaiWs.send(
-          JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: msg.media.payload,
-          })
-        );
+      const payload = msg.media?.payload;
+      if (!payload) return;
+
+      if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+        audioQueue.push(payload);
+        if (audioQueue.length > MAX_QUEUE_FRAMES) {
+          audioQueue.splice(0, audioQueue.length - MAX_QUEUE_FRAMES);
+        }
+        return;
       }
+
+      userFramesSinceLastCreate += 1;
+      safeSend(openaiWs, { type: "input_audio_buffer.append", audio: payload });
+      return;
     }
+
+    if (msg.event === "stop") {
+      if (MB_DEBUG) console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
+      try {
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
+      } catch {}
+      return;
+    }
+  });
+
+  twilioWs.on("close", () => {
+    if (MB_DEBUG) console.log("[WS] closed");
+    try {
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_close");
+    } catch {}
+  });
+
+  twilioWs.on("error", (e) => {
+    console.error("[TWILIO] ws error", e && (e.message || e));
+    try {
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1011, "twilio_error");
+    } catch {}
   });
 });
 
 server.listen(PORT, () => {
+  const base = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
   console.log(`==> Service live on port ${PORT}`);
+  console.log(`==> Health: ${base}/health`);
 });
