@@ -285,7 +285,6 @@ function isNo(text) {
 function extractILPhoneDigits(text) {
   const t = String(text || "");
   const digits = t.replace(/[^\d]/g, "");
-  // Israel numbers usually 9-10 digits (including leading 0)
   if (digits.length === 9 || digits.length === 10) return digits;
   return null;
 }
@@ -295,18 +294,40 @@ function isCallbackRequested(text) {
   return /(תחזרו|תחזור|חזרה|שיחזרו|טלפון חוזר|תתקשרו|שיחה חוזרת|שיחזר אליי|לחזור אלי|לחזור אליי)/.test(t);
 }
 
-/* ================== Webhook sender ================== */
-async function postJson(url, payload) {
-  if (!url) return;
+/* ================== Webhook sender + https logs ================== */
+async function postJson(url, payload, meta = {}) {
+  if (!url) return { ok: false, status: null };
+
+  const started = Date.now();
+  const tag = meta.tag || "WEBHOOK";
+
   try {
-    // fire-and-forget semantics; still await to keep ordering where we call it awaited
-    await fetch(url, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
+
+    if (MB_DEBUG) {
+      const ms = Date.now() - started;
+      let bodyText = "";
+      try {
+        bodyText = await res.text();
+      } catch {}
+      const sample = String(bodyText || "").slice(0, 600);
+      console.log(`[${tag}] POST`, {
+        url,
+        status: res.status,
+        ok: res.ok,
+        ms,
+        resp_sample: sample || null,
+      });
+    }
+
+    return { ok: res.ok, status: res.status };
   } catch (e) {
-    console.error("[WEBHOOK] post failed", url, e && (e.message || String(e)));
+    console.error(`[${tag}] post failed`, { url, err: e && (e.message || String(e)) });
+    return { ok: false, status: null };
   }
 }
 
@@ -621,11 +642,8 @@ wss.on("connection", (twilioWs) => {
     if (MB_FINAL_WEBHOOK_ONLY) return;
 
     sentCallLog = true;
-    const payload = {
-      event_type: "CALL_LOG",
-      ...buildBasePayload(),
-    };
-    await postJson(ABANDONED_WEBHOOK_URL, payload);
+    const payload = { event_type: "CALL_LOG", ...buildBasePayload() };
+    await postJson(ABANDONED_WEBHOOK_URL, payload, { tag: "CALL_LOG" });
   }
 
   async function sendFinalOrPartialOnce() {
@@ -642,7 +660,7 @@ wss.on("connection", (twilioWs) => {
     if (complete) sentFinal = true;
     else sentPartial = true;
 
-    await postJson(FINAL_WEBHOOK_URL, payload);
+    await postJson(FINAL_WEBHOOK_URL, payload, { tag: complete ? "FINAL" : "PARTIAL" });
   }
 
   async function sendAbandonedOnce() {
@@ -651,11 +669,8 @@ wss.on("connection", (twilioWs) => {
     if (!CALL_LOG_WEBHOOK_URL) return;
 
     sentAbandoned = true;
-    const payload = {
-      event_type: "ABANDONED",
-      ...buildBasePayload(),
-    };
-    await postJson(CALL_LOG_WEBHOOK_URL, payload);
+    const payload = { event_type: "ABANDONED", ...buildBasePayload() };
+    await postJson(CALL_LOG_WEBHOOK_URL, payload, { tag: "ABANDONED" });
   }
 
   function captureUserUtteranceFromTranscriptionEvent(msg) {
@@ -673,32 +688,26 @@ wss.on("connection", (twilioWs) => {
     const text = String(u || "").trim();
     if (!text) return;
 
-    // closing detection
     if (isCallerWantsToEnd(text)) closingForced = true;
 
-    // callback detection (if user asks it spontaneously)
     if (!callbackRequested && isCallbackRequested(text)) {
       callbackRequested = true;
       if (MB_DEBUG) console.log("[GATE] callback_requested=true (from user)");
     }
 
-    // if expecting name
     if (expectingName && !capturedName) {
       if (looksLikeName(text)) {
         capturedName = text;
         expectingName = false;
         if (MB_DEBUG) console.log("[NAME] captured", { name: capturedName });
-
-        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
+        if (callerE164) memory.saveName(callerE164, capturedName).catch(() => {});
       } else {
         if (MB_DEBUG) console.log("[NAME] rejected", { utterance: text });
       }
       return;
     }
 
-    // message capture
     if (expectingMessage && !capturedMessage) {
-      // very light filter against single-word noise
       const cleaned = text.replace(/\s+/g, " ").trim();
       if (cleaned.length >= 2) {
         capturedMessage = cleaned;
@@ -708,7 +717,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // callback confirmation
     if (expectingCallbackConfirm) {
       if (isYes(text)) {
         expectingCallbackConfirm = false;
@@ -722,7 +730,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // callback number
     if (expectingCallbackNumber && !callbackToNumber) {
       const digits = extractILPhoneDigits(text);
       if (digits) {
@@ -775,7 +782,7 @@ wss.on("connection", (twilioWs) => {
 
     let opening = "";
     if (memoryRow && memoryRow.name) {
-      capturedName = memoryRow.name; // prefill name gate for returning caller
+      capturedName = memoryRow.name; // returning caller prefill
       if (String(returningTemplate || "").trim()) {
         opening = injectVars(returningTemplate, {
           GREETING: g.text,
@@ -967,19 +974,14 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "input_audio_buffer.speech_stopped") {
       onSpeechStopped();
 
-      // apply gates from last user utterance
-      if (lastUserUtterance) {
-        applyDeterministicGatesFromUserUtterance(lastUserUtterance);
-      }
+      if (lastUserUtterance) applyDeterministicGatesFromUserUtterance(lastUserUtterance);
 
-      // if user is ending and we have enough info, send FINAL/PARTIAL immediately
       if (closingForced) {
         callEndedAtIso = nowIso();
 
         if (capturedName && capturedMessage) {
           sendFinalOrPartialOnce().catch(() => {});
         } else {
-          // If no name -> abandoned. Else partial to FINAL_WEBHOOK_URL.
           if (!capturedName) sendAbandonedOnce().catch(() => {});
           else sendFinalOrPartialOnce().catch(() => {});
         }
@@ -996,9 +998,7 @@ wss.on("connection", (twilioWs) => {
 
     // AUDIO OUT (DO NOT TOUCH) – but allow drop window after barge-in cancel
     if (msg.type === "response.audio.delta" && streamSid) {
-      if (dropAudioUntilTs && Date.now() < dropAudioUntilTs) {
-        return; // drop audio frames
-      }
+      if (dropAudioUntilTs && Date.now() < dropAudioUntilTs) return;
 
       try {
         twilioWs.send(
@@ -1078,21 +1078,15 @@ wss.on("connection", (twilioWs) => {
 
       if (MB_DEBUG) console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
 
-      // Decide what to send on call end if not already sent
       (async () => {
-        // If user left with no name -> ABANDONED
         if (!capturedName) {
           await sendAbandonedOnce();
           return;
         }
-
-        // Has name but not complete -> PARTIAL to FINAL_WEBHOOK_URL
         if (!isLeadComplete()) {
           await sendFinalOrPartialOnce();
           return;
         }
-
-        // Complete -> FINAL
         await sendFinalOrPartialOnce();
       })().catch(() => {});
 
