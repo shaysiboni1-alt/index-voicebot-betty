@@ -985,18 +985,14 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  function maybeCreateResponse(openaiWs, reason) {
-    const now = Date.now();
-    if (responseInFlight) return;
+function maybeCreateResponse(openaiWs, reason) {
+  const now = Date.now();
+  if (responseInFlight) return;
 
-    if (!openaiWs || openaiWs.readyState !== WebWS || !openaiReady || !sessionConfigured) {
-      // NOTE: keep original logic but fix a potential typo? (DO NOT TOUCH) - we keep original branch style
-    }
-
-    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
-      pendingCreate = true;
-      return;
-    }
+  if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+    pendingCreate = true;
+    return;
+  }
 
     const DEBOUNCE_MS = 350;
     const MIN_FRAMES = 4;
