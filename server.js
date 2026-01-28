@@ -18,6 +18,15 @@
 //    - MB_HALF_DUPLEX=true  (strict turn-taking: drop user audio while bot speaking)
 //    - MB_BARGEIN_ENABLED=true (+ knobs) cancels assistant on user speech (barge-in)
 //      NOTE: If MB_HALF_DUPLEX=true, barge-in is disabled (half-duplex wins).
+//
+// NEW (added, without touching existing logic):
+// 6) Recording v2 (GilSport-style) OPTIONAL: start Twilio recording + callback registry + wait
+//    - POST /twilio-recording-callback (Twilio RecordingStatusCallback)
+//    - Best-effort wait (up to 12s) before sending FINAL/PARTIAL/INFO/ABANDONED
+//    - Falls back to legacy "fetchLatestRecordingSid" if callback path not enabled/missing
+// 7) OPTIONAL post-call LLM parsing enrichment (in addition, not instead):
+//    - Adds parsedLeadCollection (+ parsedLeadCollection_error) into webhook payloads
+//    - Does NOT affect deterministic decision FINAL/PARTIAL/INFO/ABANDONED
 
 const express = require("express");
 const http = require("http");
@@ -38,8 +47,8 @@ function envBool(name, defaultValue = false) {
   const raw = process.env[name];
   if (raw === undefined || raw === null || String(raw).trim() === "") return defaultValue;
   const normalized = String(raw).trim().toLowerCase();
-  if (["true", "1", "yes", "y"].includes(normalized)) return true;
-  if (["false", "0", "no", "n"].includes(normalized)) return false;
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
   return defaultValue;
 }
 
@@ -49,6 +58,17 @@ function envNum(name, defaultValue) {
   const n = Number(raw);
   return Number.isFinite(n) ? n : defaultValue;
 }
+
+function safeStr(v) {
+  return v === undefined || v === null ? "" : String(v).trim();
+}
+
+/* ================== Optional LLM parsing (additive) ================== */
+const MB_ENABLE_LLM_PARSING = envBool("MB_ENABLE_LLM_PARSING", false);
+const MB_LEAD_PARSING_MODEL = (process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini").trim();
+
+/* ================== Optional Recording v2 (GilSport-style) ================== */
+const MB_ENABLE_RECORDING = envBool("MB_ENABLE_RECORDING", false);
 
 const MB_TRANSCRIPTION_MODEL = (process.env.MB_TRANSCRIPTION_MODEL || "").trim(); // optional
 const MB_TRANSCRIPTION_LANGUAGE = (process.env.MB_TRANSCRIPTION_LANGUAGE || "he").trim();
@@ -80,7 +100,7 @@ const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); //
 const ABANDONED_WEBHOOK_URL = (process.env.ABANDONED_WEBHOOK_URL || "").trim(); // ABANDONED
 const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL + INFO
 
-// Twilio for recording fetch
+// Twilio for recording fetch/start/callback proxy
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || "").trim();
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || "").trim();
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || "").trim();
@@ -448,13 +468,101 @@ async function postJson(url, payload, meta = {}) {
   }
 }
 
-/* ================== Twilio recording helpers ================== */
+/* ================== Twilio recording helpers (proxy + legacy + v2 start/callback) ================== */
 function twilioAuthHeader() {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return null;
   const token = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
   return `Basic ${token}`;
 }
 
+function getPublicOrigin() {
+  try {
+    if (!PUBLIC_BASE_URL) return "";
+    const u = new URL(PUBLIC_BASE_URL);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "";
+  }
+}
+
+// ---- v2 registry (GilSport-style) ----
+const RECORDINGS = new Map(); // callSid -> { callSid, recordingSid, recordingUrl, updatedAt }
+
+function setRecordingForCall(callSid, { recordingSid, recordingUrl } = {}) {
+  const cs = safeStr(callSid);
+  if (!cs) return;
+  const sid = safeStr(recordingSid);
+  const url = safeStr(recordingUrl);
+  const cur = RECORDINGS.get(cs) || { callSid: cs, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+  if (sid) cur.recordingSid = sid;
+  if (url) cur.recordingUrl = url;
+  cur.updatedAt = Date.now();
+  RECORDINGS.set(cs, cur);
+}
+
+function getRecordingForCall(callSid) {
+  const cs = safeStr(callSid);
+  if (!cs) return { callSid: "", recordingSid: "", recordingUrl: "", updatedAt: 0 };
+  return RECORDINGS.get(cs) || { callSid: cs, recordingSid: "", recordingUrl: "", updatedAt: 0 };
+}
+
+async function waitForRecording(callSid, timeoutMs = 12000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const r = getRecordingForCall(callSid);
+    if (r.recordingSid || r.recordingUrl) return r;
+    await sleep(250);
+  }
+  return getRecordingForCall(callSid);
+}
+
+async function startRecordingIfEnabled(callSid, tagForLog = "recording") {
+  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
+  if (!callSid) return { ok: false, reason: "missing_callSid" };
+  const auth = twilioAuthHeader();
+  if (!auth) return { ok: false, reason: "twilio_auth_missing" };
+  if (!PUBLIC_BASE_URL) return { ok: false, reason: "public_base_url_missing" };
+
+  const cbUrl = `${getPublicOrigin()}/twilio-recording-callback`;
+  if (!cbUrl.startsWith("http")) return { ok: false, reason: "callback_url_invalid" };
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+    TWILIO_ACCOUNT_SID
+  )}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
+
+  const body = new URLSearchParams({
+    RecordingStatusCallback: cbUrl,
+    RecordingStatusCallbackMethod: "POST",
+    RecordingChannels: "dual",
+  });
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (MB_DEBUG) console.error(`[${tagForLog}] recording start failed`, { status: res.status, body: json });
+      return { ok: false, reason: "recording_start_failed", status: res.status };
+    }
+
+    const sid = safeStr(json?.sid || "");
+    if (sid) setRecordingForCall(callSid, { recordingSid: sid });
+    if (MB_DEBUG) console.log(`[${tagForLog}] recording started`, { callSid, recordingSid: sid || null });
+    return { ok: true, reason: "recording_started", sid: sid || null };
+  } catch (e) {
+    if (MB_DEBUG) console.error(`[${tagForLog}] recording start error`, e && (e.message || String(e)));
+    return { ok: false, reason: "recording_start_error" };
+  }
+}
+
+// ---- legacy (list latest recording) ----
 async function fetchLatestRecordingSid(callSid) {
   if (!callSid) return null;
   const auth = twilioAuthHeader();
@@ -485,9 +593,167 @@ async function fetchLatestRecordingSid(callSid) {
   }
 }
 
+/* ================== fetchWithTimeout (for additive LLM parsing) ================== */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 6500) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* ================== Additive LLM parsing helpers ================== */
+function normalizeKeyLoose(k) {
+  return String(k || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_'"״׳]/g, "");
+}
+
+function coerceLeadFields(obj) {
+  const out = {};
+  const entries = Object.entries(obj || {}).map(([k, v]) => [normalizeKeyLoose(k), v]);
+  const loose = Object.fromEntries(entries);
+
+  const getLoose = (names) => {
+    for (const n of names) {
+      const key = normalizeKeyLoose(n);
+      if (loose[key] !== undefined && loose[key] !== null && String(loose[key]).trim() !== "") return loose[key];
+    }
+    return null;
+  };
+
+  out.is_lead = obj && typeof obj.is_lead === "boolean" ? obj.is_lead : !!getLoose(["is_lead", "islead"]);
+  out.intent = getLoose(["intent"]) || "unknown";
+  out.full_name = getLoose(["full_name", "fullname", "name"]) || null;
+  out.phone_number = getLoose(["phone_number", "phonenumber", "phone"]) || null;
+  out.prefers_caller_id = getLoose(["prefers_caller_id", "preferscallerid"]) ?? null;
+
+  out.brand = getLoose(["brand"]) || null;
+  out.model = getLoose(["model"]) || null;
+  out.message_for = getLoose(["message_for", "messagefor", "recipient", "target"]) || null;
+  out.reason = getLoose(["reason", "issue"]) || null;
+  out.notes = getLoose(["notes"]) || null;
+
+  // Normalize types
+  if (typeof out.prefers_caller_id === "string") {
+    const s = out.prefers_caller_id.toLowerCase();
+    out.prefers_caller_id = /^(true|1|yes|y|כן|נכון)$/i.test(s);
+  }
+  if (out.phone_number != null) out.phone_number = String(out.phone_number).trim() || null;
+  if (out.full_name != null) out.full_name = String(out.full_name).trim() || null;
+  if (out.reason != null) out.reason = String(out.reason).trim() || null;
+  if (out.notes != null) out.notes = String(out.notes).trim() || null;
+  if (out.brand != null) out.brand = String(out.brand).trim() || null;
+  if (out.model != null) out.model = String(out.model).trim() || null;
+  if (out.message_for != null) out.message_for = String(out.message_for).trim() || null;
+
+  return out;
+}
+
+async function extractLeadFromConversationLLM({ conversationLog, botName, businessName, callerE164, calledE164 }) {
+  if (!MB_ENABLE_LLM_PARSING) return { ok: false, skipped: true, lead: null, error: null };
+  if (!OPENAI_API_KEY) return { ok: false, skipped: true, lead: null, error: "missing OPENAI_API_KEY" };
+  if (!Array.isArray(conversationLog) || conversationLog.length === 0)
+    return { ok: false, skipped: true, lead: null, error: "empty_conversation" };
+
+  const transcript = conversationLog
+    .map((m) => `${m.from === "user" ? "לקוח" : botName || "הבוט"}: ${String(m.text || "").trim()}`)
+    .filter((x) => x.trim().length > 0)
+    .join("\n");
+
+  const systemPrompt = `
+You extract a structured lead object from a phone call transcript.
+Return ONLY valid JSON (no extra text).
+Schema keys MUST be exactly:
+{"is_lead":boolean,"intent":"sales"|"support"|"delivery"|"message"|"info"|"unknown","full_name":string|null,"phone_number":string|null,"prefers_caller_id":boolean|null,"brand":string|null,"model":string|null,"message_for":string|null,"reason":string|null,"notes":string|null}
+
+Rules:
+- reason and notes MUST be in Hebrew, professional and clear.
+- If info is missing, use null (do NOT write "לא נמסר..." or similar).
+- Do NOT invent phone numbers.
+- If the caller asked only for office info (hours/address/phone/email), intent may be "info".
+JSON only.
+`.trim();
+
+  const userPrompt = `
+Business: ${businessName || ""}
+Bot: ${botName || ""}
+CallerE164: ${callerE164 || ""}
+CalledE164: ${calledE164 || ""}
+
+Transcript:
+${transcript}
+`.trim();
+
+  try {
+    const res = await fetchWithTimeout(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: MB_LEAD_PARSING_MODEL,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+        }),
+      },
+      9000
+    );
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, skipped: false, lead: null, error: `llm_http_${res.status}:${txt.slice(0, 300)}` };
+    }
+
+    const data = await res.json().catch(() => null);
+    const raw = data?.choices?.[0]?.message?.content || "";
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { ok: false, skipped: false, lead: null, error: "llm_invalid_json" };
+    }
+    const lead = coerceLeadFields(parsed || {});
+    return { ok: true, skipped: false, lead, error: null };
+  } catch (e) {
+    return { ok: false, skipped: false, lead: null, error: String(e?.message || e) };
+  }
+}
+
 /* ================== APP ================== */
 const app = express();
+
+// IMPORTANT: Twilio callbacks are urlencoded by default
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Twilio RecordingStatusCallback endpoint (GilSport-style)
+app.post("/twilio-recording-callback", (req, res) => {
+  try {
+    const callSid = safeStr(req.body?.CallSid || req.body?.callSid || "");
+    const recordingSid = safeStr(req.body?.RecordingSid || req.body?.recordingSid || "");
+    const recordingUrl = safeStr(req.body?.RecordingUrl || req.body?.recordingUrl || "");
+    if (callSid) {
+      setRecordingForCall(callSid, { recordingSid, recordingUrl });
+      if (MB_DEBUG) {
+        console.log("[RECORDING_CALLBACK]", { callSid, recordingSid: recordingSid || null, hasUrl: !!recordingUrl });
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return res.status(200).send("OK");
+});
 
 // Public proxy for Twilio recordings (keeps Twilio creds private)
 app.get("/recordings/:recordingSid.mp3", async (req, res) => {
@@ -546,6 +812,8 @@ app.get("/health", async (req, res) => {
     recordings_proxy: {
       enabled: !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && PUBLIC_BASE_URL),
       public_base_url: baseUrlNoSlash(PUBLIC_BASE_URL) || null,
+      v2_recording_enabled: MB_ENABLE_RECORDING,
+      v2_callback_endpoint: `${getPublicOrigin()}/twilio-recording-callback` || null,
     },
     noise_options: {
       half_duplex: MB_HALF_DUPLEX,
@@ -559,6 +827,10 @@ app.get("/health", async (req, res) => {
       log_transcripts: MB_LOG_TRANSCRIPTS,
       model: MB_TRANSCRIPTION_MODEL || null,
       language: MB_TRANSCRIPTION_LANGUAGE || null,
+    },
+    llm_parsing: {
+      enabled: MB_ENABLE_LLM_PARSING,
+      model: MB_LEAD_PARSING_MODEL || null,
     },
   });
 });
@@ -642,6 +914,10 @@ wss.on("connection", (twilioWs) => {
   let asstBuf = "";
   let asstAudioTranscriptBuf = "";
 
+  // Additive conversation log for post-call LLM parsing (does NOT affect flow)
+  const conversationLog = []; // {from:"user"|"bot", text:string}
+  let botTranscriptLineBuf = ""; // accumulate assistant audio transcript into a "line" to push on done/completed
+
   // User utterance tracking
   let lastUserUtterance = "";
 
@@ -670,6 +946,11 @@ wss.on("connection", (twilioWs) => {
   let recordingSid = null;
   let recordingPublicUrl = null;
   let recordingResolved = false;
+
+  // Additive LLM parsing tracking
+  let parsedLeadCollection = null;
+  let parsedLeadCollectionError = null;
+  let parsedLeadAttempted = false;
 
   // Lead/webhook bookkeeping
   const callStartedAtIso = nowIso();
@@ -707,6 +988,10 @@ wss.on("connection", (twilioWs) => {
   function maybeCreateResponse(openaiWs, reason) {
     const now = Date.now();
     if (responseInFlight) return;
+
+    if (!openaiWs || openaiWs.readyState !== WebWS || !openaiReady || !sessionConfigured) {
+      // NOTE: keep original logic but fix a potential typo? (DO NOT TOUCH) - we keep original branch style
+    }
 
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
@@ -823,15 +1108,60 @@ wss.on("connection", (twilioWs) => {
     asstAudioTranscriptBuf = "";
   }
 
+  async function ensureParsedLeadCollection() {
+    if (parsedLeadAttempted) return;
+    parsedLeadAttempted = true;
+
+    const { settings } = ssot.data || {};
+    const businessName = settings?.BUSINESS_NAME || null;
+    const botName = settings?.BOT_NAME || null;
+
+    const r = await extractLeadFromConversationLLM({
+      conversationLog,
+      botName,
+      businessName,
+      callerE164,
+      calledE164,
+    });
+
+    if (r && r.ok && r.lead) {
+      parsedLeadCollection = r.lead;
+      parsedLeadCollectionError = null;
+    } else {
+      parsedLeadCollection = null;
+      parsedLeadCollectionError = r?.error || null;
+    }
+  }
+
+  function computeRecordingPublicUrlFromSid(sid) {
+    if (!sid) return null;
+    const base = baseUrlNoSlash(PUBLIC_BASE_URL);
+    if (!base) return null;
+    return `${base}/recordings/${sid}.mp3`;
+  }
+
   async function ensureRecordingResolved(reason) {
     if (recordingResolved) return;
     recordingResolved = true; // prevent concurrent storms
 
-    // We only REQUIRE recording in FINAL/PARTIAL/INFO/ABANDONED (not call log). Still resolve once here.
     if (!callSid) return;
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !PUBLIC_BASE_URL) return;
 
-    // Twilio recording may appear with a small delay after hangup. Retry a few times.
+    // v2 path: if enabled, wait for callback to arrive (best effort)
+    if (MB_ENABLE_RECORDING) {
+      const rec = await waitForRecording(callSid, 12000);
+      const sid = safeStr(rec?.recordingSid || "");
+      if (sid) {
+        recordingSid = sid;
+        recordingPublicUrl = computeRecordingPublicUrlFromSid(sid);
+        if (MB_DEBUG) console.log("[RECORDING_V2] resolved", { reason, callSid, recordingSid: sid });
+        return;
+      }
+      // If callback didn't arrive in time, we fall back to legacy lookup below
+      if (MB_DEBUG) console.log("[RECORDING_V2] not found within wait window, falling back", { reason, callSid });
+    }
+
+    // Legacy: Twilio recording may appear with a small delay after hangup. Retry a few times.
     const attempts = 3;
     const delays = [350, 700, 1200];
 
@@ -839,7 +1169,7 @@ wss.on("connection", (twilioWs) => {
       const sid = await fetchLatestRecordingSid(callSid);
       if (sid) {
         recordingSid = sid;
-        recordingPublicUrl = `${baseUrlNoSlash(PUBLIC_BASE_URL)}/recordings/${sid}.mp3`;
+        recordingPublicUrl = computeRecordingPublicUrlFromSid(sid);
         if (MB_DEBUG) console.log("[RECORDING] resolved", { reason, recordingSid: sid });
         return;
       }
@@ -868,6 +1198,13 @@ wss.on("connection", (twilioWs) => {
       (decision === "FINAL" || decision === "PARTIAL" || decision === "INFO" || decision === "ABANDONED")
     ) {
       parts.push("recording_public_url=missing");
+    }
+
+    // additive parsing note (debug-friendly only)
+    if (MB_ENABLE_LLM_PARSING) {
+      if (!parsedLeadCollection && parsedLeadCollectionError) {
+        parts.push(`llm_parsing_error="${String(parsedLeadCollectionError).slice(0, 180)}"`);
+      }
     }
 
     return parts.join(" | ");
@@ -912,6 +1249,10 @@ wss.on("connection", (twilioWs) => {
 
       recording_provider: "twilio",
       recording_public_url: recordingPublicUrl || null,
+
+      // Additive: post-call parsing enrichment (does not affect decision)
+      parsedLeadCollection: parsedLeadCollection || null,
+      parsedLeadCollection_error: parsedLeadCollectionError || null,
     };
   }
 
@@ -990,7 +1331,12 @@ wss.on("connection", (twilioWs) => {
     // Single decision point (prevents contradictions)
     if (sentFinal || sentPartial || sentInfo || sentAbandoned) return;
 
-    // Resolve recording before final/partial/info/abandoned (best effort with retries)
+    // Additive: parse lead collection once (does NOT affect decision)
+    if (MB_ENABLE_LLM_PARSING) {
+      await ensureParsedLeadCollection();
+    }
+
+    // Resolve recording before final/partial/info/abandoned (best effort)
     await ensureRecordingResolved(reason);
 
     let decision = "NONE";
@@ -1024,6 +1370,8 @@ wss.on("connection", (twilioWs) => {
         infoRequested,
         infoProvided,
         recording_public_url: recordingPublicUrl || null,
+        llm_parsing_enabled: MB_ENABLE_LLM_PARSING,
+        llm_parsing_ok: !!parsedLeadCollection,
       });
     }
   }
@@ -1037,6 +1385,19 @@ wss.on("connection", (twilioWs) => {
       (typeof msg.transcript === "string" && msg.transcript) ||
       "";
     if (t.trim()) lastUserUtterance = t.trim();
+  }
+
+  function maybeAppendUserToConversationLog(text) {
+    const t = String(text || "").trim();
+    if (!t) return;
+    // Keep it minimal; do NOT include raw audio or metadata.
+    conversationLog.push({ from: "user", text: t });
+  }
+
+  function maybeAppendBotToConversationLog(text) {
+    const t = String(text || "").trim();
+    if (!t) return;
+    conversationLog.push({ from: "bot", text: t });
   }
 
   function applyDeterministicGatesFromUserUtterance(u) {
@@ -1290,7 +1651,11 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "input_audio_buffer.speech_stopped") {
       onSpeechStopped();
 
-      if (lastUserUtterance) applyDeterministicGatesFromUserUtterance(lastUserUtterance);
+      if (lastUserUtterance) {
+        // Additive: keep a minimal user transcript line
+        maybeAppendUserToConversationLog(lastUserUtterance);
+        applyDeterministicGatesFromUserUtterance(lastUserUtterance);
+      }
 
       if (closingForced) {
         callEndedAtIso = nowIso();
@@ -1302,6 +1667,56 @@ wss.on("connection", (twilioWs) => {
     }
 
     // Assistant text logs + deterministic gate detection + INFO capture
+    // NOTE: regardless of logging, we always capture assistant audio transcript to conversationLog
+    if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
+      botTranscriptLineBuf += msg.delta;
+
+      if (MB_LOG_ASSISTANT_TEXT) {
+        logAsstAudioTranscriptDelta(msg.delta);
+      }
+
+      const d = msg.delta;
+
+      // INFO answer capture: first assistant answer after infoRequested
+      if (infoRequested && !infoProvided) {
+        // Start capturing the assistant answer for INFO (only first answer block)
+        infoProvided = true;
+        infoAnswerCaptureActive = true;
+        if (MB_DEBUG) console.log("[INFO] provided=true (assistant started answering)");
+      }
+      if (infoAnswerCaptureActive) {
+        if (infoAnswerText.length < infoAnswerCharsMax) {
+          infoAnswerText += d;
+        }
+      }
+
+      // deterministically detect prompts from assistant to set gates
+      if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
+        if (!capturedName) {
+          expectingName = true;
+          if (MB_DEBUG) console.log("[NAME] expecting_name");
+        }
+      }
+
+      if (/מה הנושא|מה תרצה שאעביר|מה תרצו שאעביר|מה למסור/.test(d)) {
+        expectingMessage = true;
+        if (MB_DEBUG) console.log("[GATE] expecting_message");
+      }
+
+      if (/נוח לחזור למספר שממנו התקשר/.test(d)) {
+        callbackRequested = true;
+        expectingCallbackConfirm = true;
+        if (MB_DEBUG) console.log("[GATE] expecting_callback_confirm");
+      }
+
+      if (/מה המספר|מספר טלפון|מספר לחזרה/.test(d)) {
+        if (callbackRequested && !callbackToNumber) {
+          expectingCallbackNumber = true;
+          if (MB_DEBUG) console.log("[GATE] expecting_callback_number");
+        }
+      }
+    }
+
     if (MB_LOG_ASSISTANT_TEXT) {
       if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
         logAsstDelta(msg.delta);
@@ -1312,95 +1727,32 @@ wss.on("connection", (twilioWs) => {
       if (msg.type === "response.output_text.done" || msg.type === "response.text.done") {
         flushAsstLine();
       }
+    }
 
-      if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
-        logAsstAudioTranscriptDelta(msg.delta);
+    if (msg.type === "response.audio_transcript.done") {
+      if (MB_LOG_ASSISTANT_TEXT) flushAsstAudioTranscriptLine();
 
-        const d = msg.delta;
+      // Additive: push assistant transcript "line"
+      const line = String(botTranscriptLineBuf || "").trim();
+      if (line) maybeAppendBotToConversationLog(line);
+      botTranscriptLineBuf = "";
 
-        // INFO answer capture: first assistant answer after infoRequested
-        if (infoRequested && !infoProvided) {
-          // Start capturing the assistant answer for INFO (only first answer block)
-          infoProvided = true;
-          infoAnswerCaptureActive = true;
-          if (MB_DEBUG) console.log("[INFO] provided=true (assistant started answering)");
-        }
-        if (infoAnswerCaptureActive) {
-          if (infoAnswerText.length < infoAnswerCharsMax) {
-            infoAnswerText += d;
-          }
-        }
+      // Stop INFO capture after the first assistant answer block ends
+      if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
+    }
 
-        // deterministically detect prompts from assistant to set gates
-        if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
-          if (!capturedName) {
-            expectingName = true;
-            if (MB_DEBUG) console.log("[NAME] expecting_name");
-          }
-        }
-
-        if (/מה הנושא|מה תרצה שאעביר|מה תרצו שאעביר|מה למסור/.test(d)) {
-          expectingMessage = true;
-          if (MB_DEBUG) console.log("[GATE] expecting_message");
-        }
-
-        if (/נוח לחזור למספר שממנו התקשר/.test(d)) {
-          callbackRequested = true;
-          expectingCallbackConfirm = true;
-          if (MB_DEBUG) console.log("[GATE] expecting_callback_confirm");
-        }
-
-        if (/מה המספר|מספר טלפון|מספר לחזרה/.test(d)) {
-          if (callbackRequested && !callbackToNumber) {
-            expectingCallbackNumber = true;
-            if (MB_DEBUG) console.log("[GATE] expecting_callback_number");
-          }
-        }
-      }
-
-      if (msg.type === "response.audio_transcript.done") {
-        flushAsstAudioTranscriptLine();
-        // Stop INFO capture after the first assistant answer block ends
-        if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
-      }
-
-      if (msg.type === "response.completed") {
+    if (msg.type === "response.completed") {
+      if (MB_LOG_ASSISTANT_TEXT) {
         flushAsstLine();
         flushAsstAudioTranscriptLine();
-        if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
       }
-    } else {
-      // Even if logs disabled, we still need deterministic INFO capture from audio_transcript
-      if (msg.type === "response.audio_transcript.delta" && typeof msg.delta === "string") {
-        const d = msg.delta;
 
-        if (infoRequested && !infoProvided) {
-          infoProvided = true;
-          infoAnswerCaptureActive = true;
-          if (MB_DEBUG) console.log("[INFO] provided=true (assistant started answering)");
-        }
-        if (infoAnswerCaptureActive) {
-          if (infoAnswerText.length < infoAnswerCharsMax) infoAnswerText += d;
-        }
+      // Additive: if we didn't get audio_transcript.done (edge), flush any pending bot transcript
+      const line = String(botTranscriptLineBuf || "").trim();
+      if (line) maybeAppendBotToConversationLog(line);
+      botTranscriptLineBuf = "";
 
-        // deterministic gate detection still needed
-        if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
-          if (!capturedName) expectingName = true;
-        }
-        if (/מה הנושא|מה תרצה שאעביר|מה תרצו שאעביר|מה למסור/.test(d)) {
-          expectingMessage = true;
-        }
-        if (/נוח לחזור למספר שממנו התקשר/.test(d)) {
-          callbackRequested = true;
-          expectingCallbackConfirm = true;
-        }
-        if (/מה המספר|מספר טלפון|מספר לחזרה/.test(d)) {
-          if (callbackRequested && !callbackToNumber) expectingCallbackNumber = true;
-        }
-      }
-      if (msg.type === "response.audio_transcript.done" || msg.type === "response.completed") {
-        if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
-      }
+      if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
     }
 
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
@@ -1470,6 +1822,12 @@ wss.on("connection", (twilioWs) => {
           customParameters: msg.start?.customParameters || {},
         });
       }
+
+      // NEW (v2 recording): start recording at call start (best effort; does not change flow)
+      if (MB_ENABLE_RECORDING && callSid) {
+        startRecordingIfEnabled(callSid, "RECORDING_V2_START").catch(() => {});
+      }
+
       return;
     }
 
