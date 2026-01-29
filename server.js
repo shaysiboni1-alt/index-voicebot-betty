@@ -62,6 +62,19 @@ function safeStr(v) {
   return v === undefined || v === null ? "" : String(v).trim();
 }
 
+function oneLine(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function clip(s, n) {
+  const str = String(s || "");
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (str.length <= n) return str;
+  return str.slice(0, n) + "…";
+}
+
 /* ================== Optional LLM parsing (additive) ================== */
 const MB_ENABLE_LLM_PARSING = envBool("MB_ENABLE_LLM_PARSING", false);
 const MB_LEAD_PARSING_MODEL = (process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini").trim();
@@ -91,6 +104,13 @@ const MB_DEBUG = envBool("MB_DEBUG", false);
 // If STT enabled, default log transcripts to true unless explicitly disabled
 const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", !!MB_TRANSCRIPTION_MODEL);
 const MB_LOG_ASSISTANT_TEXT = envBool("MB_LOG_ASSISTANT_TEXT", false);
+const MB_LOG_TURNS = envBool("MB_LOG_TURNS", true);
+const MB_LOG_TURNS_MAX_CHARS = envNum("MB_LOG_TURNS_MAX_CHARS", 900);
+
+function logTurn(obj) {
+  if (!MB_LOG_TURNS) return;
+  console.log(`[TURNLOG] ${JSON.stringify(obj)}`);
+}
 
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", false);
 const MB_NAME_CAPTURE_EARLY_WINDOW_SEC = envNum("MB_NAME_CAPTURE_EARLY_WINDOW_SEC", 30);
@@ -969,6 +989,14 @@ wss.on("connection", (twilioWs) => {
   const audioQueue = [];
   const MAX_QUEUE_FRAMES = 400;
 
+  let turnSeq = 0;
+  let lastAsstCreateId = 0;
+  let lastAsstSaidId = 0;
+  let lastUserSaidId = 0;
+  let lastAsstIntendedText = "";
+  let lastAsstSaidText = "";
+  let lastUserSttText = "";
+
   // Transcript aggregation
   let sttBuf = "";
   let asstBuf = "";
@@ -1070,6 +1098,22 @@ wss.on("connection", (twilioWs) => {
     lastResponseCreateAt = now;
     userFramesSinceLastCreate = 0;
 
+    turnSeq += 1;
+    lastAsstCreateId += 1;
+    logTurn({
+      t: nowIso(),
+      seq: turnSeq,
+      kind: "ASST_CREATE",
+      create_id: lastAsstCreateId,
+      reason: reason || null,
+      note: "default_response.create_no_custom_instructions",
+      callSid,
+      streamSid,
+      caller: callerE164,
+      half_duplex: MB_HALF_DUPLEX,
+      bargein: MB_BARGEIN_ENABLED,
+    });
+
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
     responseInFlight = true;
@@ -1115,6 +1159,22 @@ wss.on("connection", (twilioWs) => {
       finalizeCallAfterClosing(reason, openaiWs, twilioWs);
       return;
     }
+
+    turnSeq += 1;
+    lastAsstCreateId += 1;
+    lastAsstIntendedText = closingLine;
+    logTurn({
+      t: nowIso(),
+      seq: turnSeq,
+      kind: "ASST_INTENDED",
+      create_id: lastAsstCreateId,
+      phase: "CLOSING",
+      intended: clip(oneLine(closingLine), MB_LOG_TURNS_MAX_CHARS),
+      reason: reason || null,
+      callSid,
+      streamSid,
+      caller: callerE164,
+    });
 
     safeSend(openaiWs, {
       type: "response.create",
@@ -1453,6 +1513,20 @@ wss.on("connection", (twilioWs) => {
     // Single decision point (prevents contradictions)
     if (sentFinal || sentPartial || sentAbandoned) return;
 
+    turnSeq += 1;
+    logTurn({
+      t: nowIso(),
+      seq: turnSeq,
+      kind: "CALL_END_DECIDE",
+      reason: reason || null,
+      name: capturedName || null,
+      message: capturedMessage ? clip(oneLine(capturedMessage), 220) : null,
+      callback_requested: !!callbackRequested,
+      callback_to_number: callbackToNumber || null,
+      info_requested: !!infoRequested,
+      info_topics: infoTopics && infoTopics.length ? infoTopics : null,
+    });
+
     // Additive: parse lead collection once (does NOT affect decision)
     if (MB_ENABLE_LLM_PARSING) {
       await ensureParsedLeadCollection();
@@ -1748,6 +1822,21 @@ wss.on("connection", (twilioWs) => {
     sendCallLogOnce().catch(() => {});
 
     // Opening: speak immediately (no extra pre-say)
+    turnSeq += 1;
+    lastAsstCreateId += 1;
+    lastAsstIntendedText = opening;
+    logTurn({
+      t: nowIso(),
+      seq: turnSeq,
+      kind: "ASST_INTENDED",
+      create_id: lastAsstCreateId,
+      phase: "OPENING",
+      intended: clip(oneLine(opening), MB_LOG_TURNS_MAX_CHARS),
+      callSid,
+      streamSid,
+      caller: callerE164,
+    });
+
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -1789,10 +1878,42 @@ wss.on("connection", (twilioWs) => {
 
         if (typeof msg.text === "string") {
           logSTTLine(msg.text);
+          const finalUser = (msg.text || msg.transcript || "").trim();
+          if (finalUser) {
+            turnSeq += 1;
+            lastUserSaidId += 1;
+            lastUserSttText = finalUser;
+            logTurn({
+              t: nowIso(),
+              seq: turnSeq,
+              kind: "USER_SAID_STT",
+              user_id: lastUserSaidId,
+              text: clip(oneLine(finalUser), MB_LOG_TURNS_MAX_CHARS),
+              callSid,
+              streamSid,
+              caller: callerE164,
+            });
+          }
           sttBuf = "";
         }
         if (typeof msg.transcript === "string") {
           logSTTLine(msg.transcript);
+          const finalUser = (msg.text || msg.transcript || "").trim();
+          if (finalUser) {
+            turnSeq += 1;
+            lastUserSaidId += 1;
+            lastUserSttText = finalUser;
+            logTurn({
+              t: nowIso(),
+              seq: turnSeq,
+              kind: "USER_SAID_STT",
+              user_id: lastUserSaidId,
+              text: clip(oneLine(finalUser), MB_LOG_TURNS_MAX_CHARS),
+              callSid,
+              streamSid,
+              caller: callerE164,
+            });
+          }
           sttBuf = "";
         }
 
@@ -1801,7 +1922,25 @@ wss.on("connection", (twilioWs) => {
           msg.type.toLowerCase().includes("completed") ||
           msg.type.toLowerCase().includes("result")
         ) {
-          if (sttBuf.trim()) logSTTLine(sttBuf);
+          if (sttBuf.trim()) {
+            const finalUser = sttBuf.trim();
+            logSTTLine(finalUser);
+            if (finalUser) {
+              turnSeq += 1;
+              lastUserSaidId += 1;
+              lastUserSttText = finalUser;
+              logTurn({
+                t: nowIso(),
+                seq: turnSeq,
+                kind: "USER_SAID_STT",
+                user_id: lastUserSaidId,
+                text: clip(oneLine(finalUser), MB_LOG_TURNS_MAX_CHARS),
+                callSid,
+                streamSid,
+                caller: callerE164,
+              });
+            }
+          }
           sttBuf = "";
         }
       }
@@ -1903,6 +2042,29 @@ wss.on("connection", (twilioWs) => {
 
       // Additive: push assistant transcript "line"
       const line = String(botTranscriptLineBuf || "").trim();
+      if (line) {
+        const normalizedLine = oneLine(line);
+        const normalizedIntended = oneLine(lastAsstIntendedText);
+        const approxMatch =
+          normalizedIntended && normalizedLine
+            ? normalizedIntended.includes(normalizedLine.slice(0, 18)) ||
+              normalizedLine.includes(normalizedIntended.slice(0, 18))
+            : null;
+        turnSeq += 1;
+        lastAsstSaidId += 1;
+        lastAsstSaidText = line;
+        logTurn({
+          t: nowIso(),
+          seq: turnSeq,
+          kind: "ASST_SAID",
+          said_id: lastAsstSaidId,
+          text: clip(normalizedLine, MB_LOG_TURNS_MAX_CHARS),
+          approx_match: approxMatch,
+          callSid,
+          streamSid,
+          caller: callerE164,
+        });
+      }
       if (line) maybeAppendBotToConversationLog(line);
       botTranscriptLineBuf = "";
 
@@ -2013,6 +2175,21 @@ wss.on("connection", (twilioWs) => {
           customParameters: msg.start?.customParameters || {},
         });
       }
+
+      turnSeq += 1;
+      logTurn({
+        t: nowIso(),
+        seq: turnSeq,
+        kind: "CALL_START",
+        callSid,
+        streamSid,
+        caller: callerE164,
+        called: calledE164,
+        half_duplex: MB_HALF_DUPLEX,
+        bargein: MB_BARGEIN_ENABLED,
+        ssot_loaded_at: ssot.loaded_at || null,
+        ssot_stale: Date.now() >= ssot._expires ? true : false,
+      });
 
       // NEW (v2 recording): start recording at call start (best effort; does not change flow)
       if (MB_ENABLE_RECORDING && callSid) {
