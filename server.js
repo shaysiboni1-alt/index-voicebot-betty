@@ -410,6 +410,20 @@ function looksLikeName(text) {
   return true;
 }
 
+function sanitizePersonName(name) {
+  const raw = safeStr(name);
+  if (!raw) return null;
+  let cleaned = raw.replace(/\s+/g, " ").trim();
+  cleaned = cleaned.replace(/^[\s"'״׳.,!?-]+|[\s"'״׳.,!?-]+$/g, "").trim();
+  cleaned = cleaned.replace(/[!?…]+$/g, "").trim();
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length > 3) return null;
+  if (cleaned.length > 22) return null;
+  return cleaned;
+}
+
 function extractNameFromSelfIntro(text) {
   const t = String(text || "").trim();
   if (!t) return null;
@@ -493,7 +507,7 @@ function isCallbackRequested(text) {
 function isInfoRequest(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  return /(שעות|שעות פעילות|עד מתי|מתי פתוח|מתי פתוחים|כתובת|איפה אתם|מיקום|טלפון|מספר טלפון|איך מתקשרים|מייל|אימייל|דוא"ל|email)/i.test(
+  return /(שעות|שואות|שוט|שוטת|שעותת|שעה פתיחה|שעות פתיחה|עד מתי|מתי פתוח|מתי פתוחים|באיזה שעה|כתובת|איפה אתם|איפו|איפה נמצא|איפה נמצאים|מיקום|טלפון|מספר טלפון|איך מתקשרים|מס׳|מס\b|מספר|פלאפון|טל|מייל|אימייל|דוא"ל|דואל|email)/i.test(
     t
   );
 }
@@ -502,10 +516,20 @@ function detectInfoTopics(text) {
   const t = String(text || "").toLowerCase();
   const topics = [];
 
-  if (/(שעות|שעות פעילות|פתוח|פתוחים|סגור|סגורים)/.test(t)) topics.push("WORKING_HOURS");
-  if (/(כתובת|איפה אתם|מיקום)/.test(t)) topics.push("BUSINESS_ADDRESS");
-  if (/(טלפון|מספר טלפון|איך מתקשרים|מספר)/.test(t)) topics.push("MAIN_PHONE");
-  if (/(מייל|אימייל|דוא"ל|email)/.test(t)) topics.push("BUSINESS_EMAIL");
+  if (
+    /(שעות|שואות|שוט|שוטת|שעותת|שעה פתיחה|שעות פתיחה|עד מתי|מתי פתוח|מתי פתוחים|באיזה שעה|פתוח|פתוחים|סגור|סגורים)/.test(
+      t
+    )
+  ) {
+    topics.push("WORKING_HOURS");
+  }
+  if (/(כתובת|איפה אתם|איפו|איפה נמצא|איפה נמצאים|מיקום)/.test(t)) {
+    topics.push("BUSINESS_ADDRESS");
+  }
+  if (/(טלפון|מספר טלפון|איך מתקשרים|מס׳|מס\b|מספר|פלאפון|טל)/.test(t)) {
+    topics.push("MAIN_PHONE");
+  }
+  if (/(מייל|אימייל|דוא"ל|דואל|email)/.test(t)) topics.push("BUSINESS_EMAIL");
 
   return Array.from(new Set(topics));
 }
@@ -1518,6 +1542,7 @@ wss.on("connection", (twilioWs) => {
       t: nowIso(),
       seq: turnSeq,
       kind: "CALL_END_DECIDE",
+      phase: "pre_enrichment",
       reason: reason || null,
       name: capturedName || null,
       message: capturedMessage ? clip(oneLine(capturedMessage), 220) : null,
@@ -1525,6 +1550,8 @@ wss.on("connection", (twilioWs) => {
       callback_to_number: callbackToNumber || null,
       info_requested: !!infoRequested,
       info_topics: infoTopics && infoTopics.length ? infoTopics : null,
+      llm_parsing_ok: !!parsedLeadCollection,
+      enriched_from_llm: enrichedFromLlm,
     });
 
     // Additive: parse lead collection once (does NOT affect decision)
@@ -1532,6 +1559,23 @@ wss.on("connection", (twilioWs) => {
       await ensureParsedLeadCollection();
       applyLlmEnrichmentForDecision();
     }
+
+    turnSeq += 1;
+    logTurn({
+      t: nowIso(),
+      seq: turnSeq,
+      kind: "CALL_END_DECIDE",
+      phase: "post_enrichment",
+      reason: reason || null,
+      name: capturedName || null,
+      message: capturedMessage ? clip(oneLine(capturedMessage), 220) : null,
+      callback_requested: !!callbackRequested,
+      callback_to_number: callbackToNumber || null,
+      info_requested: !!infoRequested,
+      info_topics: infoTopics && infoTopics.length ? infoTopics : null,
+      llm_parsing_ok: !!parsedLeadCollection,
+      enriched_from_llm: enrichedFromLlm,
+    });
 
     // Resolve recording before final/partial/abandoned (best effort)
     await ensureRecordingResolved(reason);
@@ -1611,19 +1655,23 @@ wss.on("connection", (twilioWs) => {
     if (!capturedName) {
       const introName = extractNameFromSelfIntro(text);
       if (introName) {
-        capturedName = introName;
-        nameCapturedFrom = "caller_stt";
-        expectingName = false;
-        assistantAskedNameAt = 0;
-        if (MB_DEBUG) console.log("[NAME] captured_intro", { name: capturedName });
-        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
-        return;
+        const cleanedIntro = sanitizePersonName(introName);
+        if (cleanedIntro && looksLikeName(cleanedIntro)) {
+          capturedName = cleanedIntro;
+          nameCapturedFrom = "caller_stt";
+          expectingName = false;
+          assistantAskedNameAt = 0;
+          if (MB_DEBUG) console.log("[NAME] captured_intro", { name: capturedName });
+          if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
+          return;
+        }
       }
     }
 
     if (expectingName && !capturedName) {
-      if (looksLikeName(text)) {
-        capturedName = text;
+      const cleaned = sanitizePersonName(text);
+      if (cleaned && looksLikeName(cleaned)) {
+        capturedName = cleaned;
         nameCapturedFrom = "caller_stt";
         expectingName = false;
         assistantAskedNameAt = 0;
@@ -1639,7 +1687,9 @@ wss.on("connection", (twilioWs) => {
       shouldAttemptEarlyNameCapture(capturedName, connStartedAtMs, userUtteranceCount) &&
       looksLikeName(text)
     ) {
-      capturedName = text;
+      const cleanedEarly = sanitizePersonName(text);
+      if (!cleanedEarly || !looksLikeName(cleanedEarly)) return;
+      capturedName = cleanedEarly;
       nameCapturedFrom = "caller_stt";
       expectingName = false;
       assistantAskedNameAt = 0;
@@ -1749,17 +1799,19 @@ wss.on("connection", (twilioWs) => {
     const returningTemplate = settings.OPENING_SCRIPT_RETURNING || "";
 
     let opening = "";
+    let memName = null;
     if (memoryRow && memoryRow.name) {
-      capturedName = memoryRow.name; // returning caller prefill
+      memName = sanitizePersonName(memoryRow.name) || memoryRow.name;
+      capturedName = memName; // returning caller prefill
       if (String(returningTemplate || "").trim()) {
         opening = injectVars(returningTemplate, {
           GREETING: g.text,
           BOT_NAME: settings.BOT_NAME,
           BUSINESS_NAME: settings.BUSINESS_NAME,
-          CALLER_NAME: memoryRow.name,
+          CALLER_NAME: memName,
         });
       } else {
-        opening = `${g.text}, ${memoryRow.name}, נעים לשמוע ממך שוב. איך נוכל לעזור?`;
+        opening = `${g.text}, ${memName}, נעים לשמוע ממך שוב. איך נוכל לעזור?`;
       }
     } else {
       opening = injectVars(openingTemplate, {
@@ -1770,6 +1822,14 @@ wss.on("connection", (twilioWs) => {
     }
 
     const settingsContext = buildSettingsContext(settings);
+
+    const memoryRepeatTemplate = safeStr(settings.MEMORY_REPEAT_TEMPLATE || "");
+    let memoryRule = "";
+    if (memName && memoryRepeatTemplate) {
+      memoryRule = injectVars(memoryRepeatTemplate, { CALLER_NAME: memName });
+    } else if (memName) {
+      memoryRule = `שיחה חוזרת מזוהה: שם קודם="${memName}". אל תשאלי שוב לשם אלא אם הלקוח מתקן. המשיכי ישר להבנת הנושא.`;
+    }
 
     const master = injectVars(prompts.MASTER_PROMPT || "", settings);
     const guard = injectVars(prompts.GUARDRAILS_PROMPT || "", settings);
@@ -1782,16 +1842,20 @@ wss.on("connection", (twilioWs) => {
       "אם נשאלת שאלה שאין לה ערך מפורש ב-SETTINGS_CONTEXT - השתמשי ב-NO_DATA_MESSAGE מתוך SETTINGS ואז חזרי לשיחה.",
       "OPENING_SCRIPT: כאשר משתמשים בו - יש לומר מילה במילה ללא שינוי.",
       "אין לטעון שמרגריטה עזבה/אינה עובדת; מותר רק לומר שהיא לא זמינה כרגע.",
+      "אם יש CALLER_NAME מזוהה מהזיכרון: אסור לשאול שוב 'מה השם' או 'איך קוראים' אלא אם הלקוח מתקן שם מפורשות.",
     ].join(" ");
 
     const instructions = [
+      memoryRule,
       master,
       guard,
       kb,
       leadCapture,
       hardNoHallucinationLayer,
       "SETTINGS_CONTEXT (Key=Value):\n" + settingsContext,
-    ].join("\n\n");
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
     const session = {
       modalities: ["audio", "text"],
