@@ -5,14 +5,13 @@
 // 1) Webhook ENV mapping (fixed):
 //    - CALL_LOG_WEBHOOK_URL   -> CALL_LOG
 //    - ABANDONED_WEBHOOK_URL  -> ABANDONED
-//    - FINAL_WEBHOOK_URL      -> FINAL + PARTIAL + INFO
-// 2) Lead decision (single decision point): FINAL / PARTIAL / INFO / ABANDONED
+//    - FINAL_WEBHOOK_URL      -> FINAL + PARTIAL
+// 2) Lead decision (single decision point): FINAL / PARTIAL / ABANDONED
 //    - FINAL: name + message (+ callback_to_number if callback_requested)
 //    - PARTIAL: has name but missing message OR callback requested missing number
-//    - INFO: office info requested & answered (may be with/without name)
-//    - ABANDONED: not FINAL/PARTIAL/INFO and no name
+//    - ABANDONED: not FINAL/PARTIAL and no name
 // 3) INFO payload enrichment: info_request_text, info_answer_text, info_topics, notes_internal
-// 4) Twilio recording public link for FINAL/PARTIAL/INFO/ABANDONED via proxy endpoint:
+// 4) Twilio recording public link for FINAL/PARTIAL/ABANDONED via proxy endpoint:
 //    - GET /recordings/:recordingSid.mp3  (streams from Twilio with Basic Auth)
 // 5) Noise solution option (keep BOTH options in code; behavior controlled by ENV):
 //    - MB_HALF_DUPLEX=true  (strict turn-taking: drop user audio while bot speaking)
@@ -22,11 +21,11 @@
 // NEW (added, without touching existing logic):
 // 6) Recording v2 (GilSport-style) OPTIONAL: start Twilio recording + callback registry + wait
 //    - POST /twilio-recording-callback (Twilio RecordingStatusCallback)
-//    - Best-effort wait (up to 12s) before sending FINAL/PARTIAL/INFO/ABANDONED
+//    - Best-effort wait (up to 12s) before sending FINAL/PARTIAL/ABANDONED
 //    - Falls back to legacy "fetchLatestRecordingSid" if callback path not enabled/missing
 // 7) OPTIONAL post-call LLM parsing enrichment (in addition, not instead):
 //    - Adds parsedLeadCollection (+ parsedLeadCollection_error) into webhook payloads
-//    - Does NOT affect deterministic decision FINAL/PARTIAL/INFO/ABANDONED
+//    - Does NOT affect deterministic decision FINAL/PARTIAL/ABANDONED
 
 const express = require("express");
 const http = require("http");
@@ -98,7 +97,7 @@ const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", false);
 // Webhook URLs (fixed mapping)
 const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // CALL_LOG
 const ABANDONED_WEBHOOK_URL = (process.env.ABANDONED_WEBHOOK_URL || "").trim(); // ABANDONED
-const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL + INFO
+const FINAL_WEBHOOK_URL = (process.env.FINAL_WEBHOOK_URL || "").trim(); // FINAL + PARTIAL
 
 // Twilio for recording fetch/start/callback proxy
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || "").trim();
@@ -151,6 +150,13 @@ function injectVars(text, vars) {
   return out;
 }
 
+function getClosingLineFromSsot() {
+  const settings = ssot.data?.settings || {};
+  const closing = safeStr(settings?.CLOSING_SCRIPT || "");
+  if (!closing) return "";
+  return injectVars(closing, settings);
+}
+
 function buildSettingsContext(settings) {
   const lines = Object.entries(settings || {}).map(([k, v]) => `${k}=${String(v ?? "")}`);
   return lines.join("\n");
@@ -191,6 +197,7 @@ const REQUIRED_SETTINGS_KEYS = [
   "OPENING_SCRIPT",
   "OPENING_SCRIPT_RETURNING",
   "NO_DATA_MESSAGE",
+  "CLOSING_SCRIPT",
 ];
 
 const REQUIRED_PROMPTS = ["MASTER_PROMPT", "GUARDRAILS_PROMPT", "KB_PROMPT", "LEAD_CAPTURE_PROMPT"];
@@ -400,6 +407,21 @@ function extractILPhoneDigits(text) {
   const t = String(text || "");
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 9 || digits.length === 10) return digits;
+  return null;
+}
+
+function normalizePhoneLocal(input) {
+  const raw = safeStr(input);
+  if (!raw) return null;
+  const digits = raw.replace(/[^\d]/g, "");
+  if (!digits) return null;
+  if (digits.startsWith("972") && digits.length >= 11) {
+    const local = digits.slice(3);
+    if (local.length === 9) return `0${local}`;
+    if (local.length === 10 && local.startsWith("0")) return local;
+  }
+  if (digits.length === 10 && digits.startsWith("0")) return digits;
+  if (digits.length === 9) return `0${digits}`;
   return null;
 }
 function isCallbackRequested(text) {
@@ -932,6 +954,10 @@ wss.on("connection", (twilioWs) => {
   let callbackRequested = false;
   let callbackToNumber = null; // digits or e164
   let closingForced = false;
+  let callEnding = false;
+  let callEnded = false;
+  let closingResponsePending = false;
+  let responseCancelSent = false;
 
   // INFO tracking (locked)
   let infoRequested = false; // user asked office info
@@ -961,7 +987,7 @@ wss.on("connection", (twilioWs) => {
   let sentFinal = false;
   let sentAbandoned = false;
   let sentPartial = false;
-  let sentInfo = false;
+  let enrichedFromLlm = false;
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -976,6 +1002,7 @@ wss.on("connection", (twilioWs) => {
 
   function flushAudioQueue(openaiWs) {
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    if (callEnding || callEnded) return;
     if (!openaiReady || !sessionConfigured) return;
 
     while (audioQueue.length) {
@@ -985,14 +1012,14 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-function maybeCreateResponse(openaiWs, reason) {
-  const now = Date.now();
-  if (responseInFlight) return;
+  function maybeCreateResponse(openaiWs, reason) {
+    const now = Date.now();
+    if (responseInFlight || callEnding || callEnded) return;
 
-  if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
-    pendingCreate = true;
-    return;
-  }
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+      pendingCreate = true;
+      return;
+    }
 
     const DEBOUNCE_MS = 350;
     const MIN_FRAMES = 4;
@@ -1002,25 +1029,64 @@ function maybeCreateResponse(openaiWs, reason) {
     lastResponseCreateAt = now;
     userFramesSinceLastCreate = 0;
 
-    if (closingForced) {
-      safeSend(openaiWs, {
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          instructions: "ענו במשפט קצר ומנומס לסיום השיחה בלבד: תודה ולהתראות.",
-        },
-      });
-      responseInFlight = true;
-      assistantSpeaking = true;
-      if (MB_DEBUG) console.log("[CLOSING] forced");
-      return;
-    }
-
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
     responseInFlight = true;
     assistantSpeaking = true;
     if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
+  }
+
+  function finalizeCallAfterClosing(reason, openaiWs, twilioWs) {
+    if (callEnded) return;
+    callEnded = true;
+    callEndedAtIso = callEndedAtIso || nowIso();
+    if (MB_DEBUG) console.log("[CALL_END] finalize", { reason });
+
+    try {
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, reason || "call_end");
+    } catch {}
+    try {
+      if (twilioWs && twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+    } catch {}
+  }
+
+  function beginCallEnding(reason, openaiWs, twilioWs, { sendClosing = true } = {}) {
+    if (callEnding || callEnded) return;
+    callEnding = true;
+    callEndedAtIso = callEndedAtIso || nowIso();
+
+    if (!responseCancelSent && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      responseCancelSent = true;
+      try {
+        safeSend(openaiWs, { type: "response.cancel" });
+      } catch {}
+      responseInFlight = false;
+      assistantSpeaking = false;
+    }
+
+    if (!sendClosing) {
+      finalizeCallAfterClosing(reason, openaiWs, twilioWs);
+      return;
+    }
+
+    const closingLine = getClosingLineFromSsot();
+    if (!closingLine || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
+      finalizeCallAfterClosing(reason, openaiWs, twilioWs);
+      return;
+    }
+
+    safeSend(openaiWs, {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions:
+          "דברי עכשיו את הטקסט הבא ללא תוספות לפני/אחרי, באותו ניסוח בדיוק:\n" + closingLine,
+      },
+    });
+    closingResponsePending = true;
+    responseInFlight = true;
+    assistantSpeaking = true;
+    if (MB_DEBUG) console.log("[CLOSING] response.create", { reason });
   }
 
   function cancelAssistant(openaiWs) {
@@ -1179,19 +1245,17 @@ function maybeCreateResponse(openaiWs, reason) {
     const parts = [];
     parts.push(`decision=${decision}`);
 
-    if (decision === "INFO") {
-      if (infoRequestText) parts.push(`info_asked="${String(infoRequestText).slice(0, 220)}"`);
-      if (infoTopics.length) parts.push(`info_topics=${infoTopics.join(",")}`);
+    if (infoRequestText) parts.push(`info_asked="${String(infoRequestText).slice(0, 220)}"`);
+    if (infoTopics.length) parts.push(`info_topics=${infoTopics.join(",")}`);
 
-      const ans = String(infoAnswerText || "").trim();
-      if (ans) parts.push(`info_answer="${ans.slice(0, 420)}"`);
-      else parts.push("info_answer=empty");
-    }
+    const ans = String(infoAnswerText || "").trim();
+    if (ans) parts.push(`info_answer="${ans.slice(0, 420)}"`);
+    else if (infoRequested) parts.push("info_answer=empty");
 
     // recording note (debug-friendly)
     if (
       !recordingPublicUrl &&
-      (decision === "FINAL" || decision === "PARTIAL" || decision === "INFO" || decision === "ABANDONED")
+      (decision === "FINAL" || decision === "PARTIAL" || decision === "ABANDONED")
     ) {
       parts.push("recording_public_url=missing");
     }
@@ -1243,7 +1307,7 @@ function maybeCreateResponse(openaiWs, reason) {
       // internal note
       notes_internal: null,
 
-      recording_provider: "twilio",
+      recording_provider: "TWILIO",
       recording_public_url: recordingPublicUrl || null,
 
       // Additive: post-call parsing enrichment (does not affect decision)
@@ -1267,11 +1331,6 @@ function maybeCreateResponse(openaiWs, reason) {
     return false;
   }
 
-  function isInfoCall() {
-    // INFO = office info requested and answered (may be with/without name)
-    return !!infoProvided;
-  }
-
   async function sendCallLogOnce() {
     if (sentCallLog) return;
     if (!CALL_LOG_WEBHOOK_URL) return;
@@ -1288,7 +1347,7 @@ function maybeCreateResponse(openaiWs, reason) {
     if (!FINAL_WEBHOOK_URL) return;
     sentFinal = true;
 
-    const payload = { event_type: "FINAL", lead_type: "FINAL", ...buildBasePayload() };
+    const payload = { event_type: "FINAL", lead_type: "FINAL", lead_decision: "FINAL", ...buildBasePayload() };
     payload.notes_internal = buildNotesInternalForDecision("FINAL");
     await postJson(FINAL_WEBHOOK_URL, payload, { tag: "FINAL" });
   }
@@ -1298,19 +1357,9 @@ function maybeCreateResponse(openaiWs, reason) {
     if (!FINAL_WEBHOOK_URL) return;
     sentPartial = true;
 
-    const payload = { event_type: "PARTIAL", lead_type: "PARTIAL", ...buildBasePayload() };
+    const payload = { event_type: "PARTIAL", lead_type: "PARTIAL", lead_decision: "PARTIAL", ...buildBasePayload() };
     payload.notes_internal = buildNotesInternalForDecision("PARTIAL");
     await postJson(FINAL_WEBHOOK_URL, payload, { tag: "PARTIAL" });
-  }
-
-  async function sendInfoOnce() {
-    if (sentInfo) return;
-    if (!FINAL_WEBHOOK_URL) return;
-    sentInfo = true;
-
-    const payload = { event_type: "INFO", lead_type: "INFO", ...buildBasePayload() };
-    payload.notes_internal = buildNotesInternalForDecision("INFO");
-    await postJson(FINAL_WEBHOOK_URL, payload, { tag: "INFO" });
   }
 
   async function sendAbandonedOnce() {
@@ -1318,21 +1367,58 @@ function maybeCreateResponse(openaiWs, reason) {
     if (!ABANDONED_WEBHOOK_URL) return;
     sentAbandoned = true;
 
-    const payload = { event_type: "ABANDONED", lead_type: "ABANDONED", ...buildBasePayload() };
+    const payload = {
+      event_type: "ABANDONED",
+      lead_type: "ABANDONED",
+      lead_decision: "ABANDONED",
+      ...buildBasePayload(),
+    };
     payload.notes_internal = buildNotesInternalForDecision("ABANDONED");
     await postJson(ABANDONED_WEBHOOK_URL, payload, { tag: "ABANDONED" });
   }
 
+  function applyLlmEnrichmentForDecision() {
+    enrichedFromLlm = false;
+    if (!parsedLeadCollection) return;
+
+    if (!capturedName && parsedLeadCollection.full_name) {
+      capturedName = parsedLeadCollection.full_name;
+      enrichedFromLlm = true;
+    }
+
+    if (
+      !capturedMessage &&
+      parsedLeadCollection.intent === "message" &&
+      (parsedLeadCollection.reason || parsedLeadCollection.notes)
+    ) {
+      capturedMessage = parsedLeadCollection.reason || parsedLeadCollection.notes;
+      enrichedFromLlm = true;
+    }
+
+    if (callbackRequested && !callbackToNumber && parsedLeadCollection.phone_number) {
+      const normalized = normalizePhoneLocal(parsedLeadCollection.phone_number);
+      if (normalized) {
+        callbackToNumber = normalized;
+        enrichedFromLlm = true;
+      }
+    }
+
+    if (callbackToNumber) {
+      callbackToNumber = normalizePhoneLocal(callbackToNumber) || callbackToNumber;
+    }
+  }
+
   async function decideAndSendOnEnd(reason) {
     // Single decision point (prevents contradictions)
-    if (sentFinal || sentPartial || sentInfo || sentAbandoned) return;
+    if (sentFinal || sentPartial || sentAbandoned) return;
 
     // Additive: parse lead collection once (does NOT affect decision)
     if (MB_ENABLE_LLM_PARSING) {
       await ensureParsedLeadCollection();
+      applyLlmEnrichmentForDecision();
     }
 
-    // Resolve recording before final/partial/info/abandoned (best effort)
+    // Resolve recording before final/partial/abandoned (best effort)
     await ensureRecordingResolved(reason);
 
     let decision = "NONE";
@@ -1343,9 +1429,6 @@ function maybeCreateResponse(openaiWs, reason) {
     } else if (isPartialLead()) {
       decision = "PARTIAL";
       await sendPartialOnce();
-    } else if (isInfoCall()) {
-      decision = "INFO";
-      await sendInfoOnce();
     } else if (!capturedName) {
       decision = "ABANDONED";
       await sendAbandonedOnce();
@@ -1368,6 +1451,7 @@ function maybeCreateResponse(openaiWs, reason) {
         recording_public_url: recordingPublicUrl || null,
         llm_parsing_enabled: MB_ENABLE_LLM_PARSING,
         llm_parsing_ok: !!parsedLeadCollection,
+        enriched_from_llm: enrichedFromLlm,
       });
     }
   }
@@ -1440,7 +1524,7 @@ function maybeCreateResponse(openaiWs, reason) {
     if (expectingCallbackConfirm) {
       if (isYes(text)) {
         expectingCallbackConfirm = false;
-        callbackToNumber = callerE164 || null;
+        callbackToNumber = normalizePhoneLocal(callerE164) || null;
         if (MB_DEBUG) console.log("[GATE] callback_confirmed_callerid", { callbackToNumber });
       } else if (isNo(text)) {
         expectingCallbackConfirm = false;
@@ -1453,7 +1537,7 @@ function maybeCreateResponse(openaiWs, reason) {
     if (expectingCallbackNumber && !callbackToNumber) {
       const digits = extractILPhoneDigits(text);
       if (digits) {
-        callbackToNumber = digits;
+        callbackToNumber = normalizePhoneLocal(digits) || digits;
         expectingCallbackNumber = false;
         if (MB_DEBUG) console.log("[GATE] callback_number_captured", { callbackToNumber });
       }
@@ -1474,6 +1558,12 @@ function maybeCreateResponse(openaiWs, reason) {
   openaiWs.on("open", async () => {
     if (MB_DEBUG) console.log("[OPENAI] ws open");
     openaiReady = true;
+    if (callEnding || callEnded) {
+      try {
+        openaiWs.close(1000, "call_already_ended");
+      } catch {}
+      return;
+    }
 
     const cache = getSSOTCacheFast();
     if (!cache.ok) {
@@ -1654,8 +1744,9 @@ function maybeCreateResponse(openaiWs, reason) {
       }
 
       if (closingForced) {
-        callEndedAtIso = nowIso();
+        beginCallEnding("closing_forced", openaiWs, twilioWs, { sendClosing: true });
         decideAndSendOnEnd("closing_forced").catch(() => {});
+        return;
       }
 
       maybeCreateResponse(openaiWs, "speech_stopped");
@@ -1754,6 +1845,10 @@ function maybeCreateResponse(openaiWs, reason) {
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
       assistantSpeaking = false;
+      if (closingResponsePending) {
+        closingResponsePending = false;
+        finalizeCallAfterClosing("closing_audio_done", openaiWs, twilioWs);
+      }
       return;
     }
 
@@ -1761,6 +1856,8 @@ function maybeCreateResponse(openaiWs, reason) {
     if (msg.type === "response.audio.delta" && streamSid) {
       assistantSpeaking = true;
 
+      if (callEnded) return;
+      if (callEnding && !closingResponsePending) return;
       if (dropAudioUntilTs && Date.now() < dropAudioUntilTs) return;
 
       try {
@@ -1830,6 +1927,7 @@ function maybeCreateResponse(openaiWs, reason) {
     if (msg.event === "media") {
       const payload = msg.media?.payload;
       if (!payload) return;
+      if (callEnding || callEnded) return;
 
       // Half-duplex: drop user audio while assistant is speaking
       if (MB_HALF_DUPLEX && assistantSpeaking) {
@@ -1851,14 +1949,11 @@ function maybeCreateResponse(openaiWs, reason) {
 
     if (msg.event === "stop") {
       callEndedAtIso = nowIso();
+      beginCallEnding("twilio_stop", openaiWs, twilioWs, { sendClosing: false });
 
       if (MB_DEBUG) console.log("[WS] stop", { callSid: msg.stop?.callSid || callSid });
 
       decideAndSendOnEnd("twilio_stop").catch(() => {});
-
-      try {
-        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_stop");
-      } catch {}
       return;
     }
   });
@@ -1870,13 +1965,12 @@ function maybeCreateResponse(openaiWs, reason) {
       callEndedAtIso = nowIso();
       decideAndSendOnEnd("twilio_close").catch(() => {});
     }
-    try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1000, "twilio_close");
-    } catch {}
+    beginCallEnding("twilio_close", openaiWs, twilioWs, { sendClosing: false });
   });
 
   twilioWs.on("error", (e) => {
     console.error("[TWILIO] ws error", e && (e.message || e));
+    beginCallEnding("twilio_error", openaiWs, twilioWs, { sendClosing: false });
     try {
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(1011, "twilio_error");
     } catch {}
