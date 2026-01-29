@@ -93,6 +93,9 @@ const MB_LOG_TRANSCRIPTS = envBool("MB_LOG_TRANSCRIPTS", !!MB_TRANSCRIPTION_MODE
 const MB_LOG_ASSISTANT_TEXT = envBool("MB_LOG_ASSISTANT_TEXT", false);
 
 const MB_FINAL_WEBHOOK_ONLY = envBool("MB_FINAL_WEBHOOK_ONLY", false);
+const MB_NAME_CAPTURE_EARLY_WINDOW_SEC = envNum("MB_NAME_CAPTURE_EARLY_WINDOW_SEC", 30);
+const MB_NAME_CAPTURE_EARLY_UTTERANCES = envNum("MB_NAME_CAPTURE_EARLY_UTTERANCES", 2);
+const MB_NAME_EXPECTING_TTL_MS = envNum("MB_NAME_EXPECTING_TTL_MS", 12000);
 
 // Webhook URLs (fixed mapping)
 const CALL_LOG_WEBHOOK_URL = (process.env.CALL_LOG_WEBHOOK_URL || "").trim(); // CALL_LOG
@@ -385,6 +388,40 @@ function looksLikeName(text) {
     if (w.startsWith("ב") && w.length >= 4) return false;
   }
   return true;
+}
+
+function extractNameFromSelfIntro(text) {
+  const t = String(text || "").trim();
+  if (!t) return null;
+  const match = t.match(/\b(קוראים לי|שמי|אני|מדבר|מדברת|זה|זאת)\s+([^\n\r,.!?]{1,22})/);
+  if (!match) return null;
+  const prefix = String(match[1] || "").trim();
+  const rawName = String(match[2] || "").trim();
+  const cleaned = rawName.replace(/^[\s"'״׳.,!?-]+|[\s"'״׳.,!?-]+$/g, "").trim();
+  if (!cleaned) return null;
+  if (cleaned.length > 22) return null;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (["אני", "מדבר", "מדברת"].includes(prefix)) {
+    if (words.length > 2) return null;
+    const firstWord = String(words[0] || "").toLowerCase();
+    if (
+      /^(רוצה|צריך|צריכה|מבקש|מבקשת|מתקשר|מתקשרת|מחפש|מחפשת|מבקשים|מבקשות|לגבי|על|בקשר|שאלה|בעיה|התקשרתי|פונה)$/.test(
+        firstWord
+      )
+    ) {
+      return null;
+    }
+  }
+  if (!looksLikeName(cleaned)) return null;
+  return cleaned;
+}
+
+function shouldAttemptEarlyNameCapture(capturedName, connStartedAtMs, userUtteranceCount) {
+  if (capturedName) return false;
+  return (
+    Date.now() - connStartedAtMs <= MB_NAME_CAPTURE_EARLY_WINDOW_SEC * 1000 ||
+    userUtteranceCount < MB_NAME_CAPTURE_EARLY_UTTERANCES
+  );
 }
 
 /* ================== Closing enforcement ================== */
@@ -909,6 +946,7 @@ wss.on("connection", (twilioWs) => {
   let calledE164 = null;
 
   const connT0 = Date.now();
+  const connStartedAtMs = connT0;
   let twilioStartAt = null;
 
   let openaiReady = false;
@@ -942,6 +980,9 @@ wss.on("connection", (twilioWs) => {
 
   // User utterance tracking
   let lastUserUtterance = "";
+  let userUtteranceCount = 0;
+  let assistantAskedNameAt = 0; // telemetry/debug only
+  let nameCapturedFrom = null; // "caller_stt" | null
 
   // Name/message/callback gates (deterministic)
   let expectingName = false;
@@ -1484,6 +1525,55 @@ wss.on("connection", (twilioWs) => {
     const text = String(u || "").trim();
     if (!text) return;
 
+    userUtteranceCount += 1;
+
+    if (expectingName && assistantAskedNameAt) {
+      if (Date.now() - assistantAskedNameAt > MB_NAME_EXPECTING_TTL_MS) {
+        expectingName = false;
+        assistantAskedNameAt = 0;
+      }
+    }
+
+    if (!capturedName) {
+      const introName = extractNameFromSelfIntro(text);
+      if (introName) {
+        capturedName = introName;
+        nameCapturedFrom = "caller_stt";
+        expectingName = false;
+        assistantAskedNameAt = 0;
+        if (MB_DEBUG) console.log("[NAME] captured_intro", { name: capturedName });
+        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
+        return;
+      }
+    }
+
+    if (expectingName && !capturedName) {
+      if (looksLikeName(text)) {
+        capturedName = text;
+        nameCapturedFrom = "caller_stt";
+        expectingName = false;
+        assistantAskedNameAt = 0;
+        if (MB_DEBUG) console.log("[NAME] captured", { name: capturedName });
+        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
+        return;
+      }
+      if (MB_DEBUG) console.log("[NAME] rejected", { utterance: text });
+    }
+
+    if (
+      !capturedName &&
+      shouldAttemptEarlyNameCapture(capturedName, connStartedAtMs, userUtteranceCount) &&
+      looksLikeName(text)
+    ) {
+      capturedName = text;
+      nameCapturedFrom = "caller_stt";
+      expectingName = false;
+      assistantAskedNameAt = 0;
+      if (MB_DEBUG) console.log("[NAME] captured_early", { name: capturedName });
+      if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
+      return;
+    }
+
     if (isCallerWantsToEnd(text)) closingForced = true;
 
     // INFO request detection (locked)
@@ -1497,18 +1587,6 @@ wss.on("connection", (twilioWs) => {
     if (!callbackRequested && isCallbackRequested(text)) {
       callbackRequested = true;
       if (MB_DEBUG) console.log("[GATE] callback_requested=true (from user)");
-    }
-
-    if (expectingName && !capturedName) {
-      if (looksLikeName(text)) {
-        capturedName = text;
-        expectingName = false;
-        if (MB_DEBUG) console.log("[NAME] captured", { name: capturedName });
-        if (callerE164) memory.saveName(callerE164, capturedName, MB_DEBUG).catch(() => {});
-      } else {
-        if (MB_DEBUG) console.log("[NAME] rejected", { utterance: text });
-      }
-      return;
     }
 
     if (expectingMessage && !capturedMessage) {
@@ -1777,11 +1855,15 @@ wss.on("connection", (twilioWs) => {
         }
       }
 
-      // deterministically detect prompts from assistant to set gates
-      if (/מה השם|מה שמך|איך אפשר לפנות|שם בבקשה/.test(d)) {
-        if (!capturedName) {
+      if (
+        !capturedName &&
+        /\b(מה השם|מה שמך|איך אפשר לפנות|שם בבקשה|אפשר שם|עם מי אני מדבר|עם מי אני מדברת)\b/.test(
+          botTranscriptLineBuf
+        )
+      ) {
+        if (!expectingName) {
           expectingName = true;
-          if (MB_DEBUG) console.log("[NAME] expecting_name");
+          assistantAskedNameAt = Date.now();
         }
       }
 
@@ -1824,6 +1906,14 @@ wss.on("connection", (twilioWs) => {
       if (line) maybeAppendBotToConversationLog(line);
       botTranscriptLineBuf = "";
 
+      if (
+        !capturedName &&
+        /\b(מה השם|מה שמך|איך אפשר לפנות|שם בבקשה|אפשר שם|עם מי אני מדבר|עם מי אני מדברת)\b/.test(line)
+      ) {
+        expectingName = true;
+        assistantAskedNameAt = Date.now();
+      }
+
       // Stop INFO capture after the first assistant answer block ends
       if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
     }
@@ -1838,6 +1928,14 @@ wss.on("connection", (twilioWs) => {
       const line = String(botTranscriptLineBuf || "").trim();
       if (line) maybeAppendBotToConversationLog(line);
       botTranscriptLineBuf = "";
+
+      if (
+        !capturedName &&
+        /\b(מה השם|מה שמך|איך אפשר לפנות|שם בבקשה|אפשר שם|עם מי אני מדבר|עם מי אני מדברת)\b/.test(line)
+      ) {
+        expectingName = true;
+        assistantAskedNameAt = Date.now();
+      }
 
       if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
     }
