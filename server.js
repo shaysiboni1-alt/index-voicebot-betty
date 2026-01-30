@@ -119,6 +119,15 @@ function normalizeIlPhoneDigits(input) {
   return null;
 }
 
+function buildPersonaLockInstructions() {
+  return [
+    "חובה: דברי בגוף ראשון נקבה בלבד.",
+    "חובה: פני ללקוחות בלשון רבים בלבד.",
+    "חובה: עברית מקצועית, ללא סלנג וללא שפה יומיומית.",
+    "אין לחרוג מהכללים הללו בשום מצב.",
+  ].join(" ");
+}
+
 /* ================== Optional LLM parsing (additive) ================== */
 const MB_ENABLE_LLM_PARSING = envBool("MB_ENABLE_LLM_PARSING", false);
 const MB_LEAD_PARSING_MODEL = (process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini").trim();
@@ -1091,6 +1100,7 @@ wss.on("connection", (twilioWs) => {
   let capturedMessage = null;
   let callbackRequested = false;
   let callbackToNumber = null; // digits or e164
+  let callbackToNumberConfirmed = false;
   let callbackNumberJustCaptured = false;
   let callbackNumberRetryPrompt = false;
   let callbackNumberSpoken = null;
@@ -1415,10 +1425,10 @@ wss.on("connection", (twilioWs) => {
 
   async function ensureRecordingResolved(reason) {
     if (recordingResolved) return;
-    recordingResolved = true; // prevent concurrent storms
-
     if (!callSid) return;
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !PUBLIC_BASE_URL) return;
+
+    recordingResolved = true; // prevent concurrent storms only after callSid + attempt start
 
     // v2 path: if enabled, wait for callback to arrive (best effort)
     if (MB_ENABLE_RECORDING) {
@@ -1508,7 +1518,7 @@ wss.on("connection", (twilioWs) => {
       name: capturedName || null,
       message: capturedMessage || null,
       callback_requested: !!callbackRequested,
-      callback_to_number: callbackToNumber || null,
+      callback_to_number: callbackToNumberConfirmed ? callbackToNumber : null,
 
       // INFO enrichment
       info_request_text: infoRequestText || null,
@@ -1530,7 +1540,7 @@ wss.on("connection", (twilioWs) => {
   function isLeadComplete() {
     if (!capturedName) return false;
     if (!capturedMessage) return false;
-    if (callbackRequested && !callbackToNumber) return false;
+    if (callbackRequested && !callbackToNumberConfirmed) return false;
     return true;
   }
 
@@ -1538,7 +1548,7 @@ wss.on("connection", (twilioWs) => {
     // PARTIAL = יש name אבל חסר message, או שהתבקשה חזרה וחסר callback_to_number.
     if (!capturedName) return false;
     if (!capturedMessage) return true;
-    if (callbackRequested && !callbackToNumber) return true;
+    if (callbackRequested && !callbackToNumberConfirmed) return true;
     return false;
   }
 
@@ -1610,6 +1620,7 @@ wss.on("connection", (twilioWs) => {
       const normalized = normalizePhoneLocal(parsedLeadCollection.phone_number);
       if (normalized) {
         callbackToNumber = normalized;
+        callbackToNumberConfirmed = false;
         enrichedFromLlm = true;
       }
     }
@@ -1799,7 +1810,13 @@ wss.on("connection", (twilioWs) => {
       if (MB_DEBUG) console.log("[GATE] callback_requested=true (from user)");
     }
 
-    if (expectingMessage && !capturedMessage) {
+    if (
+      expectingMessage &&
+      !capturedMessage &&
+      !expectingCallbackConfirm &&
+      !expectingCallbackNumber &&
+      !expectingCallbackNumberConfirm
+    ) {
       const cleaned = text.replace(/\s+/g, " ").trim();
       if (cleaned.length >= 2) {
         capturedMessage = cleaned;
@@ -1812,11 +1829,13 @@ wss.on("connection", (twilioWs) => {
     if (expectingCallbackNumberConfirm) {
       if (isYes(text)) {
         expectingCallbackNumberConfirm = false;
+        callbackToNumberConfirmed = true;
         closingForced = true;
         if (MB_DEBUG) console.log("[GATE] callback_number_confirmed");
       } else if (isNo(text)) {
         expectingCallbackNumberConfirm = false;
         callbackToNumber = null;
+        callbackToNumberConfirmed = false;
         callbackNumberSpoken = null;
         callbackNumberRetryPrompt = true;
         expectingCallbackNumber = true;
@@ -1829,11 +1848,36 @@ wss.on("connection", (twilioWs) => {
       if (isYes(text)) {
         expectingCallbackConfirm = false;
         callbackToNumber = normalizePhoneLocal(callerE164) || null;
+        callbackToNumberConfirmed = !!callbackToNumber;
         if (MB_DEBUG) console.log("[GATE] callback_confirmed_callerid", { callbackToNumber });
       } else if (isNo(text)) {
         expectingCallbackConfirm = false;
         expectingCallbackNumber = true;
         if (MB_DEBUG) console.log("[GATE] callback_need_new_number");
+      } else {
+        const digits = onlyDigits(text);
+        const normalized = normalizeIlPhoneDigits(digits);
+        if (normalized) {
+          expectingCallbackConfirm = false;
+          callbackToNumber = normalized;
+          callbackToNumberConfirmed = false;
+          callbackNumberJustCaptured = true;
+          callbackNumberSpoken = formatDigitsForSpeech(normalized);
+          expectingCallbackNumber = false;
+          turnSeq += 1;
+          logTurn({
+            t: nowIso(),
+            seq: turnSeq,
+            kind: "CALLBACK_NUMBER_CAPTURED",
+            raw_text: clip(oneLine(text), MB_LOG_TURNS_MAX_CHARS),
+            digits,
+            normalized,
+            callSid,
+            streamSid,
+            caller: callerE164,
+          });
+          if (MB_DEBUG) console.log("[GATE] callback_number_captured", { callbackToNumber });
+        }
       }
       return;
     }
@@ -1843,6 +1887,7 @@ wss.on("connection", (twilioWs) => {
       const normalized = normalizeIlPhoneDigits(digits);
       if (normalized) {
         callbackToNumber = normalized;
+        callbackToNumberConfirmed = false;
         callbackNumberJustCaptured = true;
         callbackNumberSpoken = formatDigitsForSpeech(normalized);
         expectingCallbackNumber = false;
@@ -1859,9 +1904,13 @@ wss.on("connection", (twilioWs) => {
           caller: callerE164,
         });
         if (MB_DEBUG) console.log("[GATE] callback_number_captured", { callbackToNumber });
+      } else {
+        callbackNumberRetryPrompt = true;
+        if (MB_DEBUG) console.log("[GATE] callback_number_invalid", { raw_text: text });
       }
       return;
     }
+
   }
 
   const openaiWs = new WebSocket(
@@ -1969,6 +2018,7 @@ wss.on("connection", (twilioWs) => {
       kb,
       leadCapture,
       hardNoHallucinationLayer,
+      buildPersonaLockInstructions(),
       "SETTINGS_CONTEXT (Key=Value):\n" + settingsContext,
     ]
       .filter(Boolean)
@@ -2210,35 +2260,6 @@ wss.on("connection", (twilioWs) => {
         }
       }
 
-      if (
-        !capturedName &&
-        /\b(מה השם|מה שמך|איך אפשר לפנות|שם בבקשה|אפשר שם|עם מי אני מדבר|עם מי אני מדברת)\b/.test(
-          botTranscriptLineBuf
-        )
-      ) {
-        if (!expectingName) {
-          expectingName = true;
-          assistantAskedNameAt = Date.now();
-        }
-      }
-
-      if (/מה הנושא|מה תרצה שאעביר|מה תרצו שאעביר|מה למסור/.test(d)) {
-        expectingMessage = true;
-        if (MB_DEBUG) console.log("[GATE] expecting_message");
-      }
-
-      if (/נוח לחזור למספר שממנו התקשר/.test(d)) {
-        callbackRequested = true;
-        expectingCallbackConfirm = true;
-        if (MB_DEBUG) console.log("[GATE] expecting_callback_confirm");
-      }
-
-      if (/מה המספר|מספר טלפון|מספר לחזרה/.test(d)) {
-        if (callbackRequested && !callbackToNumber) {
-          expectingCallbackNumber = true;
-          if (MB_DEBUG) console.log("[GATE] expecting_callback_number");
-        }
-      }
     }
 
     if (MB_LOG_ASSISTANT_TEXT) {
@@ -2284,14 +2305,6 @@ wss.on("connection", (twilioWs) => {
       if (line) maybeAppendBotToConversationLog(line);
       botTranscriptLineBuf = "";
 
-      if (
-        !capturedName &&
-        /\b(מה השם|מה שמך|איך אפשר לפנות|שם בבקשה|אפשר שם|עם מי אני מדבר|עם מי אני מדברת)\b/.test(line)
-      ) {
-        expectingName = true;
-        assistantAskedNameAt = Date.now();
-      }
-
       // Stop INFO capture after the first assistant answer block ends
       if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
     }
@@ -2306,14 +2319,6 @@ wss.on("connection", (twilioWs) => {
       const line = String(botTranscriptLineBuf || "").trim();
       if (line) maybeAppendBotToConversationLog(line);
       botTranscriptLineBuf = "";
-
-      if (
-        !capturedName &&
-        /\b(מה השם|מה שמך|איך אפשר לפנות|שם בבקשה|אפשר שם|עם מי אני מדבר|עם מי אני מדברת)\b/.test(line)
-      ) {
-        expectingName = true;
-        assistantAskedNameAt = Date.now();
-      }
 
       if (infoAnswerCaptureActive) infoAnswerCaptureActive = false;
     }
