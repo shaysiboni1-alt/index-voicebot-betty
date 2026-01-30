@@ -121,8 +121,9 @@ function normalizeIlPhoneDigits(input) {
 
 function buildPersonaLockInstructions() {
   return [
-    "חובה: דברי בגוף ראשון נקבה בלבד.",
-    "חובה: פני ללקוחות בלשון רבים בלבד.",
+    "חובה: דברי על עצמך בגוף ראשון נקבה בלבד.",
+    "חובה: ברירת המחדל לפנייה ללקוחות היא לשון רבים.",
+    "אם הלקוח ביקש במפורש לשנות לשון (יחיד/רבים/זכר/נקבה) — מותר לשנות ולהיצמד לכך עד סוף השיחה.",
     "חובה: עברית מקצועית, ללא סלנג וללא שפה יומיומית.",
     "אין לחרוג מהכללים הללו בשום מצב.",
   ].join(" ");
@@ -1166,6 +1167,7 @@ wss.on("connection", (twilioWs) => {
   function maybeCreateResponse(openaiWs, reason) {
     const now = Date.now();
     if (responseInFlight || callEnding || callEnded) return;
+    if (MB_HALF_DUPLEX && assistantSpeaking) return;
 
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
@@ -2179,10 +2181,16 @@ wss.on("connection", (twilioWs) => {
 
     // BARGE-IN hooks
     if (msg.type === "input_audio_buffer.speech_started") {
+      if (MB_HALF_DUPLEX && assistantSpeaking) {
+        return;
+      }
       onSpeechStarted(openaiWs);
       return;
     }
     if (msg.type === "input_audio_buffer.speech_stopped") {
+      if (MB_HALF_DUPLEX && assistantSpeaking) {
+        return;
+      }
       onSpeechStopped();
 
       if (lastUserUtterance) {
