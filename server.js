@@ -2144,7 +2144,7 @@ wss.on("connection", (twilioWs) => {
     // Half-duplex hardening:
     // While assistant is speaking, ignore ALL transcription-related events so we do not
     // "hear" the user during assistant speech and then react immediately after.
-    if (MB_HALF_DUPLEX && assistantSpeaking) {
+    if (MB_HALF_DUPLEX && (assistantSpeaking || responseInFlight)) {
       if (msg && typeof msg.type === "string") {
         const t = msg.type.toLowerCase();
         // covers: conversation.item.input_audio_transcription.*, response.input_audio_transcription.*, etc.
@@ -2498,7 +2498,7 @@ wss.on("connection", (twilioWs) => {
       if (callEnding || callEnded) return;
 
       // Half-duplex: drop user audio while assistant is speaking
-      if (MB_HALF_DUPLEX && assistantSpeaking) {
+      if (MB_HALF_DUPLEX && (assistantSpeaking || responseInFlight)) {
         return;
       }
 
