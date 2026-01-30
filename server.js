@@ -1140,6 +1140,7 @@ wss.on("connection", (twilioWs) => {
   let sentAbandoned = false;
   let sentPartial = false;
   let enrichedFromLlm = false;
+  let filteredTranscriptionDuringSpeechCount = 0;
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -1150,6 +1151,14 @@ wss.on("connection", (twilioWs) => {
       console.error("[OPENAI] send failed", e && (e.message || e));
       return false;
     }
+  }
+
+  function clearOpenAIInputAudioBuffer(openaiWs) {
+    // Half-duplex hardening: clear any queued audio that might have arrived right
+    // before the assistant started speaking, to avoid "buffered" STT while speaking.
+    if (!MB_HALF_DUPLEX) return;
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    safeSend(openaiWs, { type: "input_audio_buffer.clear" });
   }
 
   function flushAudioQueue(openaiWs) {
@@ -1182,6 +1191,7 @@ wss.on("connection", (twilioWs) => {
     lastResponseCreateAt = now;
     userFramesSinceLastCreate = 0;
 
+    clearOpenAIInputAudioBuffer(openaiWs);
     turnSeq += 1;
     lastAsstCreateId += 1;
     logTurn({
@@ -1202,7 +1212,12 @@ wss.on("connection", (twilioWs) => {
     pendingCreate = false;
     responseInFlight = true;
     assistantSpeaking = true;
-    if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
+    if (MB_DEBUG) {
+      console.log("[TURN] response.create", {
+        reason: reason || "speech_stopped",
+        assistantSpeaking,
+      });
+    }
   }
 
   function sendFixedResponse(openaiWs, text, reason, phase) {
@@ -1212,6 +1227,7 @@ wss.on("connection", (twilioWs) => {
       return false;
     }
 
+    clearOpenAIInputAudioBuffer(openaiWs);
     turnSeq += 1;
     lastAsstCreateId += 1;
     lastAsstIntendedText = text;
@@ -1239,7 +1255,12 @@ wss.on("connection", (twilioWs) => {
 
     responseInFlight = true;
     assistantSpeaking = true;
-    if (MB_DEBUG) console.log("[TURN] response.create", reason || "fixed_response");
+    if (MB_DEBUG) {
+      console.log("[TURN] response.create", {
+        reason: reason || "fixed_response",
+        assistantSpeaking,
+      });
+    }
     return true;
   }
 
@@ -1298,6 +1319,7 @@ wss.on("connection", (twilioWs) => {
       caller: callerE164,
     });
 
+    clearOpenAIInputAudioBuffer(openaiWs);
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -1309,7 +1331,9 @@ wss.on("connection", (twilioWs) => {
     closingResponsePending = true;
     responseInFlight = true;
     assistantSpeaking = true;
-    if (MB_DEBUG) console.log("[CLOSING] response.create", { reason });
+    if (MB_DEBUG) {
+      console.log("[CLOSING] response.create", { reason, assistantSpeaking });
+    }
   }
 
   function cancelAssistant(openaiWs) {
@@ -2054,6 +2078,7 @@ wss.on("connection", (twilioWs) => {
     // CALL_LOG
     sendCallLogOnce().catch(() => {});
 
+    clearOpenAIInputAudioBuffer(openaiWs);
     // Opening: speak immediately (no extra pre-say)
     turnSeq += 1;
     lastAsstCreateId += 1;
@@ -2081,6 +2106,7 @@ wss.on("connection", (twilioWs) => {
     if (MB_DEBUG) {
       const tSinceConn = Date.now() - connT0;
       const tSinceStart = twilioStartAt ? Date.now() - twilioStartAt : null;
+      console.log("[OPENING] response.create", { assistantSpeaking });
       console.log("[LATENCY] opening response.create sent", {
         ms_since_ws_connection: tSinceConn,
         ms_since_twilio_start: tSinceStart,
@@ -2099,6 +2125,25 @@ wss.on("connection", (twilioWs) => {
       msg = JSON.parse(raw.toString());
     } catch {
       return;
+    }
+
+    // Half-duplex hardening:
+    // While assistant is speaking, ignore ALL transcription-related events so we do not
+    // "hear" the user during assistant speech and then react immediately after.
+    if (MB_HALF_DUPLEX && assistantSpeaking) {
+      if (msg && typeof msg.type === "string") {
+        const t = msg.type.toLowerCase();
+        // covers: conversation.item.input_audio_transcription.*, response.input_audio_transcription.*, etc.
+        if (t.includes("transcription")) {
+          filteredTranscriptionDuringSpeechCount += 1;
+          if (MB_DEBUG && filteredTranscriptionDuringSpeechCount % 10 === 0) {
+            console.log("[HALF_DUPLEX] filtered_transcription_events", {
+              count: filteredTranscriptionDuringSpeechCount,
+            });
+          }
+          return;
+        }
+      }
     }
 
     // capture user utterance
