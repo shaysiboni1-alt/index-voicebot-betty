@@ -75,6 +75,50 @@ function clip(s, n) {
   return str.slice(0, n) + "…";
 }
 
+function onlyDigits(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function formatDigitsForSpeech(digits) {
+  const d = onlyDigits(digits);
+  if (!d) return "";
+  const wordsMap = {
+    0: "אפס",
+    1: "אחת",
+    2: "שתיים",
+    3: "שלוש",
+    4: "ארבע",
+    5: "חמש",
+    6: "שש",
+    7: "שבע",
+    8: "שמונה",
+    9: "תשע",
+  };
+  const out = [];
+  for (let i = 0; i < d.length; i += 1) {
+    const ch = d[i];
+    if (!(ch in wordsMap)) continue;
+    out.push(wordsMap[ch]);
+    if ((i === 2 || i === 5) && i < d.length - 1) {
+      out.push(",");
+    }
+  }
+  return out.join(" ").replace(/\s+,/g, ",");
+}
+
+function normalizeIlPhoneDigits(input) {
+  const digits = onlyDigits(input);
+  if (!digits) return null;
+  if (digits.startsWith("972") && digits.length >= 11) {
+    const local = digits.slice(3);
+    if (local.length === 9) return `0${local}`;
+    if (local.length === 10 && local.startsWith("0")) return local;
+  }
+  if (digits.length === 10 && digits.startsWith("0")) return digits;
+  if (digits.length === 9) return `0${digits}`;
+  return null;
+}
+
 /* ================== Optional LLM parsing (additive) ================== */
 const MB_ENABLE_LLM_PARSING = envBool("MB_ENABLE_LLM_PARSING", false);
 const MB_LEAD_PARSING_MODEL = (process.env.MB_LEAD_PARSING_MODEL || "gpt-4.1-mini").trim();
@@ -1041,11 +1085,15 @@ wss.on("connection", (twilioWs) => {
   let expectingMessage = false;
   let expectingCallbackConfirm = false;
   let expectingCallbackNumber = false;
+  let expectingCallbackNumberConfirm = false;
 
   let capturedName = null;
   let capturedMessage = null;
   let callbackRequested = false;
   let callbackToNumber = null; // digits or e164
+  let callbackNumberJustCaptured = false;
+  let callbackNumberRetryPrompt = false;
+  let callbackNumberSpoken = null;
   let closingForced = false;
   let callEnding = false;
   let callEnded = false;
@@ -1143,6 +1191,44 @@ wss.on("connection", (twilioWs) => {
     responseInFlight = true;
     assistantSpeaking = true;
     if (MB_DEBUG) console.log("[TURN] response.create", reason || "speech_stopped");
+  }
+
+  function sendFixedResponse(openaiWs, text, reason, phase) {
+    if (responseInFlight || callEnding || callEnded) return false;
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
+      pendingCreate = true;
+      return false;
+    }
+
+    turnSeq += 1;
+    lastAsstCreateId += 1;
+    lastAsstIntendedText = text;
+    logTurn({
+      t: nowIso(),
+      seq: turnSeq,
+      kind: "ASST_INTENDED",
+      create_id: lastAsstCreateId,
+      phase: phase || null,
+      intended: clip(oneLine(text), MB_LOG_TURNS_MAX_CHARS),
+      reason: reason || null,
+      callSid,
+      streamSid,
+      caller: callerE164,
+    });
+
+    safeSend(openaiWs, {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions:
+          "דברי עכשיו את הטקסט הבא ללא תוספות לפני/אחרי, באותו ניסוח בדיוק:\n" + text,
+      },
+    });
+
+    responseInFlight = true;
+    assistantSpeaking = true;
+    if (MB_DEBUG) console.log("[TURN] response.create", reason || "fixed_response");
+    return true;
   }
 
   function finalizeCallAfterClosing(reason, openaiWs, twilioWs) {
@@ -1723,6 +1809,22 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
+    if (expectingCallbackNumberConfirm) {
+      if (isYes(text)) {
+        expectingCallbackNumberConfirm = false;
+        closingForced = true;
+        if (MB_DEBUG) console.log("[GATE] callback_number_confirmed");
+      } else if (isNo(text)) {
+        expectingCallbackNumberConfirm = false;
+        callbackToNumber = null;
+        callbackNumberSpoken = null;
+        callbackNumberRetryPrompt = true;
+        expectingCallbackNumber = true;
+        if (MB_DEBUG) console.log("[GATE] callback_number_rejected");
+      }
+      return;
+    }
+
     if (expectingCallbackConfirm) {
       if (isYes(text)) {
         expectingCallbackConfirm = false;
@@ -1737,10 +1839,25 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (expectingCallbackNumber && !callbackToNumber) {
-      const digits = extractILPhoneDigits(text);
-      if (digits) {
-        callbackToNumber = normalizePhoneLocal(digits) || digits;
+      const digits = onlyDigits(text);
+      const normalized = normalizeIlPhoneDigits(digits);
+      if (normalized) {
+        callbackToNumber = normalized;
+        callbackNumberJustCaptured = true;
+        callbackNumberSpoken = formatDigitsForSpeech(normalized);
         expectingCallbackNumber = false;
+        turnSeq += 1;
+        logTurn({
+          t: nowIso(),
+          seq: turnSeq,
+          kind: "CALLBACK_NUMBER_CAPTURED",
+          raw_text: clip(oneLine(text), MB_LOG_TURNS_MAX_CHARS),
+          digits,
+          normalized,
+          callSid,
+          streamSid,
+          caller: callerE164,
+        });
         if (MB_DEBUG) console.log("[GATE] callback_number_captured", { callbackToNumber });
       }
       return;
@@ -2027,6 +2144,41 @@ wss.on("connection", (twilioWs) => {
       if (closingForced) {
         beginCallEnding("closing_forced", openaiWs, twilioWs, { sendClosing: true });
         decideAndSendOnEnd("closing_forced").catch(() => {});
+        return;
+      }
+
+      if (callbackNumberRetryPrompt) {
+        const sent = sendFixedResponse(
+          openaiWs,
+          "אוקיי, מה המספר הנכון?",
+          "callback_number_retry",
+          "CALLBACK_RETRY"
+        );
+        if (sent) {
+          callbackNumberRetryPrompt = false;
+        }
+        return;
+      }
+
+      if (callbackNumberJustCaptured && callbackNumberSpoken) {
+        const confirmText = `רק לוודא, המספר הוא: ${callbackNumberSpoken}. זה נכון?`;
+        const sent = sendFixedResponse(openaiWs, confirmText, "callback_number_confirm", "CALLBACK_CONFIRM");
+        if (sent) {
+          callbackNumberJustCaptured = false;
+          expectingCallbackNumberConfirm = true;
+          turnSeq += 1;
+          logTurn({
+            t: nowIso(),
+            seq: turnSeq,
+            kind: "CALLBACK_NUMBER_CONFIRM_PROMPT",
+            normalized: callbackToNumber,
+            spoken: callbackNumberSpoken,
+            callSid,
+            streamSid,
+            caller: callerE164,
+          });
+          return;
+        }
         return;
       }
 
