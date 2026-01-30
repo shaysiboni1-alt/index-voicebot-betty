@@ -1141,6 +1141,7 @@ wss.on("connection", (twilioWs) => {
   let sentPartial = false;
   let enrichedFromLlm = false;
   let filteredTranscriptionDuringSpeechCount = 0;
+  let clearedInputOnThisResponse = false;
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -1174,9 +1175,16 @@ wss.on("connection", (twilioWs) => {
   }
 
   function maybeCreateResponse(openaiWs, reason) {
+    if (MB_HALF_DUPLEX && (assistantSpeaking || responseInFlight)) {
+      if (MB_DEBUG) {
+        console.log("[HALF_DUPLEX] block response.create while assistant speaking", {
+          reason,
+        });
+      }
+      return;
+    }
     const now = Date.now();
     if (responseInFlight || callEnding || callEnded) return;
-    if (MB_HALF_DUPLEX && assistantSpeaking) return;
 
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
@@ -1211,7 +1219,7 @@ wss.on("connection", (twilioWs) => {
     safeSend(openaiWs, { type: "response.create" });
     pendingCreate = false;
     responseInFlight = true;
-    assistantSpeaking = true;
+    clearedInputOnThisResponse = false;
     if (MB_DEBUG) {
       console.log("[TURN] response.create", {
         reason: reason || "speech_stopped",
@@ -1222,6 +1230,7 @@ wss.on("connection", (twilioWs) => {
 
   function sendFixedResponse(openaiWs, text, reason, phase) {
     if (responseInFlight || callEnding || callEnded) return false;
+    if (MB_HALF_DUPLEX && assistantSpeaking) return false;
     if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady || !sessionConfigured) {
       pendingCreate = true;
       return false;
@@ -1244,6 +1253,8 @@ wss.on("connection", (twilioWs) => {
       caller: callerE164,
     });
 
+    if (MB_HALF_DUPLEX && assistantSpeaking) return;
+
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -1254,7 +1265,7 @@ wss.on("connection", (twilioWs) => {
     });
 
     responseInFlight = true;
-    assistantSpeaking = true;
+    clearedInputOnThisResponse = false;
     if (MB_DEBUG) {
       console.log("[TURN] response.create", {
         reason: reason || "fixed_response",
@@ -1289,13 +1300,14 @@ wss.on("connection", (twilioWs) => {
         safeSend(openaiWs, { type: "response.cancel" });
       } catch {}
       responseInFlight = false;
-      assistantSpeaking = false;
     }
 
     if (!sendClosing) {
       finalizeCallAfterClosing(reason, openaiWs, twilioWs);
       return;
     }
+
+    if (MB_HALF_DUPLEX && assistantSpeaking) return;
 
     const closingLine = getClosingLineFromSsot();
     if (!closingLine || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) {
@@ -1330,7 +1342,7 @@ wss.on("connection", (twilioWs) => {
     });
     closingResponsePending = true;
     responseInFlight = true;
-    assistantSpeaking = true;
+    clearedInputOnThisResponse = false;
     if (MB_DEBUG) {
       console.log("[CLOSING] response.create", { reason, assistantSpeaking });
     }
@@ -2095,6 +2107,8 @@ wss.on("connection", (twilioWs) => {
       caller: callerE164,
     });
 
+    if (MB_HALF_DUPLEX && assistantSpeaking) return;
+
     safeSend(openaiWs, {
       type: "response.create",
       response: {
@@ -2103,6 +2117,7 @@ wss.on("connection", (twilioWs) => {
       },
     });
 
+    clearedInputOnThisResponse = false;
     if (MB_DEBUG) {
       const tSinceConn = Date.now() - connT0;
       const tSinceStart = twilioStartAt ? Date.now() - twilioStartAt : null;
@@ -2114,7 +2129,6 @@ wss.on("connection", (twilioWs) => {
     }
 
     responseInFlight = true;
-    assistantSpeaking = true;
     flushAudioQueue(openaiWs);
     if (pendingCreate) maybeCreateResponse(openaiWs, "pending_after_open");
   });
@@ -2226,14 +2240,14 @@ wss.on("connection", (twilioWs) => {
 
     // BARGE-IN hooks
     if (msg.type === "input_audio_buffer.speech_started") {
-      if (MB_HALF_DUPLEX && assistantSpeaking) {
+      if (MB_HALF_DUPLEX && (assistantSpeaking || responseInFlight)) {
         return;
       }
       onSpeechStarted(openaiWs);
       return;
     }
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      if (MB_HALF_DUPLEX && assistantSpeaking) {
+      if (MB_HALF_DUPLEX && (assistantSpeaking || responseInFlight)) {
         return;
       }
       onSpeechStopped();
@@ -2379,6 +2393,7 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "response.audio.done" || msg.type === "response.completed") {
       responseInFlight = false;
       assistantSpeaking = false;
+      clearedInputOnThisResponse = false;
       if (closingResponsePending) {
         closingResponsePending = false;
         finalizeCallAfterClosing("closing_audio_done", openaiWs, twilioWs);
@@ -2388,7 +2403,13 @@ wss.on("connection", (twilioWs) => {
 
     // AUDIO OUT (DO NOT TOUCH) – but allow drop window after barge-in cancel
     if (msg.type === "response.audio.delta" && streamSid) {
-      assistantSpeaking = true;
+      if (!assistantSpeaking) {
+        assistantSpeaking = true;
+      }
+      if (!clearedInputOnThisResponse) {
+        clearOpenAIInputAudioBuffer(openaiWs);
+        clearedInputOnThisResponse = true;
+      }
 
       if (callEnded) return;
       if (callEnding && !closingResponsePending) return;
@@ -2410,13 +2431,11 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("error", (e) => {
     responseInFlight = false;
-    assistantSpeaking = false;
     console.error("[OPENAI] ws error", e && (e.message || e));
   });
 
   openaiWs.on("close", (code, reason) => {
     responseInFlight = false;
-    assistantSpeaking = false;
     if (MB_DEBUG) console.log("[OPENAI] ws closed", { code, reason: String(reason || "") });
   });
 
